@@ -3,36 +3,6 @@ from tvm import relay
 from tvm.driver.build_module import schedule_to_module
 
 
-def collect_top_level_loops(prim_func):
-    loops = []
-    prev = None
-
-    def callback(node):
-        global prev
-        if isinstance(node, tvm.tir.For) and not isinstance(prev, tvm.tir.For):
-            loops.append(node)
-        
-        prev = node
-        return True
-
-    tvm.tir.stmt_functor.pre_order_visit(prim_func.body, callback)
-
-    return loops
-
-
-def collect_blocks(prim_func):
-    blocks = []
-
-    def callback(node):
-        if isinstance(node, tvm.tir.Block):
-            blocks.append(node)
-        
-        return True
-
-    tvm.tir.stmt_functor.pre_order_visit(prim_func.body, callback)
-
-    return blocks
-
 
 def lower_tiled(node : relay.Function, tile_dims : tuple[int,int]) -> tvm.tir.PrimFunc:
     assert len(tile_dims) == len(node.ret_type.shape)
@@ -49,43 +19,41 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int,int]) -> tvm.tir.Pr
 
     prim_func = tvm.te.create_prim_func(inputs + [output])
     
-    
-    
     sch = tvm.tir.Schedule(prim_func)
-    loops = collect_top_level_loops(prim_func)
-    blocks = collect_blocks(prim_func)
+
+    # Bring all computations into an outer loop of dimension corresponding to the size of the output
+    block_to_inline = sch.get_output_blocks("root")[0]
+    while len(sch.get_producers(block_to_inline)) > 0:
+        block_to_inline = sch.get_producers(block_to_inline)[0]
+        for i in range(len(output.op.axis)):
+            sch.compute_at(block_to_inline, sch.get_loops(sch.get_output_blocks("root")[0])[i])
+        
     
-    import pdb; pdb.set_trace()
-    blocks = sch.get_output_blocks("root")
-    sch.compute_inline(blocks[0])
+    # Tile
+    prev_inners = []
+    for i in range(len(tile_dims)):
+        outer, inner = sch.split(sch.get_loops(sch.get_output_blocks("root")[0])[2*i], (None, tile_dims[i]))
+        if len(prev_inners) > 0:
+            sch.reorder(outer, *prev_inners)
+        prev_inners.append(inner)
 
-
-    # Split H and W dims into inner and outer?? 
-    loops = sch.get_loops(sch.get_block("conv2d_nchw"))
-    xo, xi = sch.split(loops[2], [None, tile_dims[0]])
-    yo, yi = sch.split(loops[3], [None, tile_dims[1]])
     
-
-    # Reorder so that outer is outside of inner
-    sch.reorder(xo, yo, xi, yi)
-
-    # Blockize tiles
-    sch.blockize(xi)
+    # Blockize tiles-- doesn't work
+    # sch.blockize(prev_inners[0])
     
     
     
     # xo, yo, xi, yi = sch[output].tile(output.op.axis[-2], output.op.axis[-1], x_factor=tile_dims[0], y_factor=tile_dims[1])
     
-    for loop in loops:
-        sch.annotate(loop, ann_key="software_pipeline_stage", ann_val=[0, 1])
-        sch.annotate(loop, ann_key="software_pipeline_order", ann_val=[0, 1])
+    # outer_loops = sch.get_loops(sch.get_output_blocks("root")[0])[len(output.op.axis)-1:len(output.op.axis)]
+    # for outer_loop in outer_loops:
+    #     sch.annotate(outer_loop, ann_key="software_pipeline_stage", ann_val=[0, 1])
+    #     sch.annotate(outer_loop, ann_key="software_pipeline_order", ann_val=[0, 1])
     
-    
-    mod = tvm.IRModule.from_expr(prim_func.with_attr("global_symbol", "main"))
-    mod = tvm.tir.transform.InjectSoftwarePipeline()(mod)
+    import pdb; pdb.set_trace()
+    mod = tvm.tir.transform.InjectSoftwarePipeline()(sch.mod)
     prim_func = mod["main"]
 
-    
     
     
     # s.annotate(xo, )
