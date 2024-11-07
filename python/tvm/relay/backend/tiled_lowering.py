@@ -100,9 +100,11 @@ def get_input_itervar_dependencies(sch : tir.Schedule) -> dict[tir.Buffer, list[
         in_itervar_deps[input_var] = []
         for itervar in input_itervars[input_var]:
             in_itervar_deps[input_var] += itervar_deps[itervar]
+        
+        if len(in_itervar_deps[input_var]) == 0:
+            del in_itervar_deps[input_var]
 
     return in_itervar_deps
-
 
 
 
@@ -137,7 +139,18 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
             cache_block = sch.cache_read(block, buf_idx, storage_scope='local')
             if(cur_max_restriction != -1):
                 sch.compute_at(cache_block, outer_loop_rvs[cur_max_restriction])
-            
+
+                cur_loop_annotations = sch.get(outer_loop_rvs[cur_max_restriction]).annotations
+                if(cur_loop_annotations.get("software_pipeline_stage") is not None):
+                    new_stage_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_stage")]
+                    new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
+                else:
+                    new_stage_annotation = [0, 1]
+                    new_order_annotation = [0, 1]
+
+                sch.annotate(outer_loop_rvs[cur_max_restriction], "software_pipeline_stage", new_stage_annotation)
+                sch.annotate(outer_loop_rvs[cur_max_restriction], "software_pipeline_order", new_order_annotation)
+                    
             cache_read_injected[buffer] = True
 
 
@@ -156,6 +169,24 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
     recursive_helper(sch.get_output_blocks("root")[0])
     assert all([injected for injected in cache_read_injected.values()]), " We missed injecting cache read for at least one buffer {}".format(cache_read_injected)
 
+def inject_cache_write(sch : tir.Schedule, out_dims : int):
+
+    inner_tiling_loop = sch.get_loops(sch.get_output_blocks("root")[0])[out_dims - 1]
+    cache_block = sch.cache_write(sch.get_output_blocks("root")[0], 0, "local")
+    sch.reverse_compute_at(cache_block, inner_tiling_loop)
+    cur_loop_annotations = sch.get(inner_tiling_loop).annotations
+
+    if(cur_loop_annotations.get("software_pipeline_stage") is not None):
+        new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
+        new_stage_annotation.append(max(new_stage_annotation) + 1)
+        new_order_annotation = list(cur_loop_annotations.get("software_pipeline_order"))
+        new_stage_annotation.append(len(new_order_annotation))
+    else:
+        new_stage_annotation = [0, 1]
+        new_order_annotation = [0, 1]
+
+    sch.annotate(inner_tiling_loop, "software_pipeline_stage", new_stage_annotation)
+    sch.annotate(inner_tiling_loop, "software_pipeline_order", new_order_annotation)
 
 def lower_tiled(node : relay.Function, tile_dims : tuple[int]) -> tir.PrimFunc:
     assert len(tile_dims) == len(node.ret_type.shape)
@@ -163,39 +194,23 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int]) -> tir.PrimFunc:
     assert isinstance(node, relay.Function)
     assert not isinstance(node.ret_type, tvm.ir.container.Array), "Only single-output nodes supported (Not sure if there is a legitamite reason to tile a multi-output node in this way)"
    
-    
     # Lower Relay function to TensorIR
     cached_func = tvm._ffi.get_global_func("relay.backend.LowerToTE")(node)
     inputs = list(cached_func.inputs)
     output : tvm.te.Tensor = cached_func.outputs[0]
     sch = tir.Schedule(tvm.te.create_prim_func(inputs + [output]))
+    out_dims = len(output.op.axis)
 
     # Initial Transformations
-    schedule_to_single_outer_loop(sch, output_dims = len(output.op.axis))
+    schedule_to_single_outer_loop(sch, out_dims)
     tile_outer_loop(sch, tile_dims)
 
+    # Inject cache reads and writes (and software pipelining annotations)
     in_itervar_deps = get_input_itervar_dependencies(sch)
+    inject_cache_reads(sch, in_itervar_deps, out_dims)
+    inject_cache_write(sch, out_dims)
 
-    # Inject cache reads and writes
-    inject_cache_reads(sch, in_itervar_deps, output_dims = len(output.op.axis))
-    sch.cache_write(sch.get_output_blocks("root")[0], 0, "global")
-    
-
-
-    # import pdb; pdb.set_trace()
-    # Inject cache_reads
-    # cache_block = sch.cache_read(sch.get_producers(sch.get_output_blocks("root")[0])[0], 1, storage_scope='local')
-    # sch.compute_at(cache_block, 
-
-    
-    # block_to_inline = sch.get_output_blocks("root")[0]
-    # while len(sch.get_producers(block_to_inline)) > 0: 
-    #     block_to_inline = sch.get_producers(block_to_inline)[0]
-    #     for i in range(output_dims):
-    #         sch.compute_at(block_to_inline, sch.get_loops(sch.get_output_blocks("root")[0])[i])
-    
-    
-    
+    # Inject software pipelining
     mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
     prim_func = mod["main"]
 
