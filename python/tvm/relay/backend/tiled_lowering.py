@@ -119,42 +119,56 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
     outer_loop_rvs = [sch.get_loops(sch.get_output_blocks("root")[0])[i] for i in range(output_dims)] 
     outer_loop_vars = [sch.get(loop_rv).loop_var for loop_rv in outer_loop_rvs]
 
+    def add_pipeline_annotations_for_cache_read(loop_var : tir.schedule.LoopRV):
+        
+        
+        # A cache read needs to be in its own stage
+        cur_loop_annotations = sch.get(loop_var).annotations
+        if(cur_loop_annotations.get("software_pipeline_stage") is not None):
+            new_stage_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_stage")]
+            sch.unannotate(loop_var, "software_pipeline_stage")
+            new_async_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_async_stages")]
+            sch.unannotate(loop_var, "software_pipeline_async_stages")
+            new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
+            sch.unannotate(loop_var, "software_pipeline_order")
+        else:
+            num_stmts_in_loop    = len(sch.get(loop_var).body) 
+            new_stage_annotation = [0] + [1 for item in range(num_stmts_in_loop - 1)] # Put cache read in its own stage
+            new_async_annotation = [0] # cache read stage should be asynchronous
+            new_order_annotation = list(range(num_stmts_in_loop)) # Compute everything in order
+            
+        sch.annotate(loop_var, "software_pipeline_stage", new_stage_annotation)
+        sch.annotate(loop_var, "software_pipeline_async_stages", new_async_annotation)
+        sch.annotate(loop_var, "software_pipeline_order", new_order_annotation)
 
     def inject_cache_reads_per_block(block : tir.Block):
 
         for buf_idx, buf_region in enumerate(sch.get(block).reads):
 
-            if(buf_region.buffer not in sch_inputs):
+
+            # Select only reads from input buffers
+            buffer = buf_region.buffer
+            if(buffer not in sch_inputs):
                 continue
             
-            buffer = buf_region.buffer
             assert cache_read_injected[buffer] == False, " Not handled -- two reads from an input buffer"
             
+            # Determine where the cache_read should be injected using the dependencies of the itervars of the buffer read
             cur_max_restriction = -1
             for itervar_dep in in_itervar_deps[buffer]:
 
                 if(itervar_dep in outer_loop_vars):
                     cur_max_restriction = max(cur_max_restriction, outer_loop_vars.index(itervar_dep))
 
+            # Inject cache read
             cache_block = sch.cache_read(block, buf_idx, storage_scope='local')
             if(cur_max_restriction != -1):
-                sch.compute_at(cache_block, outer_loop_rvs[cur_max_restriction])
+                sch.compute_at(cache_block, outer_loop_rvs[cur_max_restriction]) # Move cache read to location found above
+                add_pipeline_annotations_for_cache_read(outer_loop_rvs[cur_max_restriction]) 
 
-                cur_loop_annotations = sch.get(outer_loop_rvs[cur_max_restriction]).annotations
-                if(cur_loop_annotations.get("software_pipeline_stage") is not None):
-                    new_stage_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_stage")]
-                    new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
-                else:
-                    new_stage_annotation = [0, 1]
-                    new_order_annotation = [0, 1]
-
-                sch.annotate(outer_loop_rvs[cur_max_restriction], "software_pipeline_stage", new_stage_annotation)
-                sch.annotate(outer_loop_rvs[cur_max_restriction], "software_pipeline_order", new_order_annotation)
-                    
             cache_read_injected[buffer] = True
 
 
-    
     def recursive_helper(cur_block : tir.Block):
         producers = sch.get_producers(cur_block)
 
@@ -172,20 +186,35 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
 def inject_cache_write(sch : tir.Schedule, out_dims : int):
 
     inner_tiling_loop = sch.get_loops(sch.get_output_blocks("root")[0])[out_dims - 1]
+    
+    # Inject cache write
     cache_block = sch.cache_write(sch.get_output_blocks("root")[0], 0, "local")
     sch.reverse_compute_at(cache_block, inner_tiling_loop)
-    cur_loop_annotations = sch.get(inner_tiling_loop).annotations
 
+    # Add annotations
+    cur_loop_annotations = sch.get(inner_tiling_loop).annotations
     if(cur_loop_annotations.get("software_pipeline_stage") is not None):
         new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
-        new_stage_annotation.append(max(new_stage_annotation) + 1)
-        new_order_annotation = list(cur_loop_annotations.get("software_pipeline_order"))
-        new_stage_annotation.append(len(new_order_annotation))
-    else:
-        new_stage_annotation = [0, 1]
-        new_order_annotation = [0, 1]
+        new_stage = max(new_stage_annotation) + 1
+        new_stage_annotation.append(new_stage)
+        sch.unannotate(inner_tiling_loop, "software_pipeline_stage")
 
+        new_async_annotation = list(cur_loop_annotations.get("software_pipeline_async_stages"))
+        new_async_annotation.append(new_stage)
+        sch.unannotate(inner_tiling_loop, "software_pipeline_async_stages")
+
+        new_order_annotation = list(cur_loop_annotations.get("software_pipeline_order"))
+        new_order_annotation.append(len(new_order_annotation))
+        sch.unannotate(inner_tiling_loop, "software_pipeline_order")
+
+    else:
+        num_stmts_in_loop = len(sch.get(inner_tiling_loop).body)
+        new_stage_annotation = [0 for item in range(num_stmts_in_loop - 1)] + [1] # Put cache_write in its own stage
+        new_async_annotation = [1] # Make cache_write asynchronous
+        new_order_annotation = list(range(num_stmts_in_loop)) # Compute all stmts in order
+        
     sch.annotate(inner_tiling_loop, "software_pipeline_stage", new_stage_annotation)
+    sch.annotate(inner_tiling_loop, "software_pipeline_async_stages", new_async_annotation)
     sch.annotate(inner_tiling_loop, "software_pipeline_order", new_order_annotation)
 
 def lower_tiled(node : relay.Function, tile_dims : tuple[int]) -> tir.PrimFunc:
@@ -205,41 +234,25 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int]) -> tir.PrimFunc:
     schedule_to_single_outer_loop(sch, out_dims)
     tile_outer_loop(sch, tile_dims)
 
-    # Inject cache reads and writes (and software pipelining annotations)
+    # Inject cache reads and writes (and associated software pipelining annotations)
     in_itervar_deps = get_input_itervar_dependencies(sch)
     inject_cache_reads(sch, in_itervar_deps, out_dims)
     inject_cache_write(sch, out_dims)
 
     # Inject software pipelining
     mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
-    prim_func = mod["main"]
 
-    
-    
-    # s.annotate(xo, )
-
-
-    # Old work
-    # s : tir.Schedule = tvm.te.create_schedule(output.op)
-    # xo, yo, xi, yi = s[output].tile(output.op.axis[-2], output.op.axis[-1], x_factor=tile_dims[0], y_factor=tile_dims[1])
-        # fused = s[output].fuse(xi,yi)
-    # lowered_func = tvm.lower(sch, inputs + [output])
-    # lowered_func = schedule_to_module(s, list(cached_func.inputs) + list(cached_func.outputs), "main")["main"]
-    # import pdb; pdb.set_trace()
-    return lowered_func
-
-
-
+    return mod["main"]
 
 
 # Define relay graph
 data = relay.var("data", relay.TensorType((1,3,224,224), "int8"))
 w0 = relay.var("w0", relay.TensorType((8,3,3,3), "int8"))
-out1 = relay.nn.conv2d(data, w0, padding = (1,1))
+out1 = relay.nn.conv2d(data, w0)
 out1_relu = relay.nn.relu(out1)
 
 w1 = relay.var("w1", relay.TensorType((12, 8,3,3), "int8"))
-out2 = relay.nn.conv2d(out1_relu, w1, padding = (1,1))
+out2 = relay.nn.conv2d(out1_relu, w1)
 out2_relu = relay.nn.relu(out2)
 
 # Wrap into a function and IRModule
@@ -251,19 +264,3 @@ mod[gv1] = func
 # Perform tiled lowering
 mod = relay.transform.InferType()(mod)
 lowered_func = lower_tiled(mod[gv1], (1, 2, 16, 16))
-
-
-
-
-
-
-# Blockize tiles-- doesn't work
-# sch.blockize(prev_inners[0])
-
-
-# xo, yo, xi, yi = sch[output].tile(output.op.axis[-2], output.op.axis[-1], x_factor=tile_dims[0], y_factor=tile_dims[1])
-
-# outer_loops = sch.get_loops(sch.get_output_blocks("root")[0])[len(output.op.axis)-1:len(output.op.axis)]
-# for outer_loop in outer_loops:
-#     sch.annotate(outer_loop, ann_key="software_pipeline_stage", ann_val=[0, 1])
-#     sch.annotate(outer_loop, ann_key="software_pipeline_order", ann_val=[0, 1])
