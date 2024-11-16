@@ -4,7 +4,7 @@ from tvm import tir
 # from tvm.driver.build_module import schedule_to_module
 
 # Bring all computations into an outer loop of dimension corresponding to the size of the output
-def schedule_to_single_outer_loop(sch : tir.Schedule, output_dims : int):
+def schedule_to_outer_loop(sch : tir.Schedule, output_dims : int):
     
     assert len(sch.get_loops(sch.get_output_blocks("root")[0])) >= output_dims, "{} < {}. ".format(len(sch.get_loops(sch.get_output_blocks("root")[0])), output_dims) + \
                                     "Output block must have at least as many loops as the number of output dimensions specified"
@@ -88,6 +88,7 @@ def get_itervar_dependencies(prim_func : tir.PrimFunc):
 # e.g. If we have the following outer tiling loops : for ax0_0, ax1_0, ax2_0, ax3_0 in T.grid(1, 6, 14, 14):
 #      And our reads from data_in are indexed using ax2_0 and ax3_0
 #      Then we might return in_outidx_deps[data_in] = [ax2_0, ax3_0]
+# Note: Could maybe simplify this by using pass tir.transform.ConvertBlocksToOpaque? 
 def get_input_itervar_dependencies(sch : tir.Schedule) -> dict[tir.Buffer, list[tir.Var]]:
     
     # Collect itervars and itervar_deps
@@ -217,50 +218,145 @@ def inject_cache_write(sch : tir.Schedule, out_dims : int):
     sch.annotate(inner_tiling_loop, "software_pipeline_async_stages", new_async_annotation)
     sch.annotate(inner_tiling_loop, "software_pipeline_order", new_order_annotation)
 
-def lower_tiled(node : relay.Function, tile_dims : tuple[int]) -> tir.PrimFunc:
-    assert len(tile_dims) == len(node.ret_type.shape)
+def reannotate_nested_pipeline_loops(sch : tir.Schedule, outer_loop_rv : tir.schedule.LoopRV, inner_loop_rv : tir.schedule.LoopRV):
+    
+    outer_loop_stmt = sch.get(outer_loop_rv)
+    inner_loop_stmt = sch.get(inner_loop_rv)
+
+    assert isinstance(outer_loop_stmt.body, tir.SeqStmt)
+    inner_loop_stmt_idx = list(outer_loop_stmt.body).index(inner_loop_stmt)
+
+
+    # An n stage pipeline has n-1 prologues, a main body, and n-1 epilogues = 2n-1 total "expanded stages" 
+    num_inner_loop_stages = max(inner_loop_stmt.annotations.get("software_pipeline_stage"))+1 # + 1 for zero indexing
+    num_expanded_pipeline_stages = int(2*num_inner_loop_stages - 1)
+
+    pipeline_order = list(outer_loop_stmt.annotations.get("software_pipeline_order"))
+
+
+    def insert_list_into_permutation_list(src : list, dest : list, pos : int):
+        for idx in range(len(src)):
+            
+            # Increment all elements greater than the one we are about to insert
+            for i in range(len(dest)):
+                if(dest[i] >= src[idx]):
+                    dest[i]+=1
+
+            dest.insert(pos + idx, src[idx])
+
+
+    
+    to_insert = [pipeline_order[inner_loop_stmt_idx] + i + 1 for i in range(num_expanded_pipeline_stages-1)]
+    insert_list_into_permutation_list(to_insert, pipeline_order, inner_loop_stmt_idx+1)
+    
+    sch.unannotate(outer_loop_rv, "software_pipeline_order")
+    sch.annotate(outer_loop_rv, "software_pipeline_order", pipeline_order)
+
+    pipeline_stage = list(outer_loop_stmt.annotations.get("software_pipeline_stage"))
+    
+    inner_loop_stage = pipeline_stage[inner_loop_stmt_idx]
+    for i in range(num_expanded_pipeline_stages-1):
+        pipeline_stage.insert(inner_loop_stmt_idx, inner_loop_stage)
+
+    sch.unannotate(outer_loop_rv, "software_pipeline_stage")
+    sch.annotate(outer_loop_rv, "software_pipeline_stage", pipeline_stage)
+
+
+
+# InjectSoftwarePipeline pass will transform the inner loops before transforming the outer loops.
+#   This will split the inner loops into multiple pipeline stages. If we have nested loops
+#   with pipeline annotations then the outer loop's annotations need to be adjusted to account for
+#   the new number of stmts in the pipeline
+def adjust_for_nested_pipelining_loops(sch : tir.Schedule, out_dims : int):
+
+    tiling_loop_rvs = [sch.get_loops(sch.get_output_blocks("root")[0])[i] for i in range(out_dims)] 
+
+    def get_annotation(loop_rv : tir.schedule.LoopRV, key):
+        return sch.get(loop_rv).annotations.get(key)
+
+    # iterate from most inner tiling loop to most outer tiling loop in pairs
+    inner_loop_rv = tiling_loop_rvs[-1]
+    for outer_loop_rv in reversed(tiling_loop_rvs[0:-1]):
+        if((get_annotation(outer_loop_rv, "software_pipeline_order") is not None) and 
+           (get_annotation(inner_loop_rv,"software_pipeline_order") is not None)):
+            
+            reannotate_nested_pipeline_loops(sch, outer_loop_rv, inner_loop_rv)
+
+        inner_loop_rv = outer_loop_rv
+
+
+    import pdb; pdb.set_trace()
+
+
+# Both 'tile_dims' and 'loop_ordering' are with respect to the output shape
+def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : tuple[int] = None) -> tir.PrimFunc:
+    out_dims = len(node.ret_type.shape)
+    assert len(tile_dims) == out_dims
     assert all([tile_dim > 0 for tile_dim in tile_dims])
     assert isinstance(node, relay.Function)
     assert not isinstance(node.ret_type, tvm.ir.container.Array), "Only single-output nodes supported (Not sure if there is a legitamite reason to tile a multi-output node in this way)"
    
+    if(loop_ordering is None):
+        loop_ordering = tuple(range(len(node.ret_type.shape)))
+    
+    assert len(loop_ordering) == len(node.ret_type.shape)
+
     # Lower Relay function to TensorIR
     cached_func = tvm._ffi.get_global_func("relay.backend.LowerToTE")(node)
     inputs = list(cached_func.inputs)
-    output : tvm.te.Tensor = cached_func.outputs[0]
+    output = cached_func.outputs[0]
     sch = tir.Schedule(tvm.te.create_prim_func(inputs + [output]))
-    out_dims = len(output.op.axis)
 
-    # Initial Transformations
-    schedule_to_single_outer_loop(sch, out_dims)
-    tile_outer_loop(sch, tile_dims)
+    # Bring all computation into outer loop corresponding to size of output
+    schedule_to_outer_loop(sch, out_dims)
+
+    # Reorder outer loops to desired order
+    outer_loops = sch.get_loops(sch.get_output_blocks("root")[0])[:out_dims]
+    outer_loops_reordered = [outer_loops[i] for i in loop_ordering]
+    sch.reorder(*outer_loops_reordered)
+    
+    # Tile outer loop
+    tile_dims_reordered = [tile_dims[i] for i in loop_ordering] 
+    tile_outer_loop(sch, tile_dims_reordered)
 
     # Inject cache reads and writes (and associated software pipelining annotations)
     in_itervar_deps = get_input_itervar_dependencies(sch)
     inject_cache_reads(sch, in_itervar_deps, out_dims)
     inject_cache_write(sch, out_dims)
+    adjust_for_nested_pipelining_loops(sch, out_dims)
 
     # Inject software pipelining
-    mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
-
+    
+    mod = tir.transform.Simplify()(sch.mod)
+    import pdb; pdb.set_trace()
+    mod = tir.transform.InjectSoftwarePipeline()(mod)
+    
+    mod = tvm.lower(mod)
+    mod = tvm.tir.transform.LoopPartition()(mod) # Not working
     return mod["main"]
 
 
 # Define relay graph
-data = relay.var("data", relay.TensorType((1,3,224,224), "int8"))
-w0 = relay.var("w0", relay.TensorType((8,3,3,3), "int8"))
-out1 = relay.nn.conv2d(data, w0)
-out1_relu = relay.nn.relu(out1)
+def test_conv2dreluconv2drelu():
+    data = relay.var("data", relay.TensorType((1,3,224,224), "int8"))
+    w0 = relay.var("w0", relay.TensorType((8,3,3,3), "int8"))
+    out1 = relay.nn.conv2d(data, w0)
+    out1_relu = relay.nn.relu(out1)
 
-w1 = relay.var("w1", relay.TensorType((12, 8,3,3), "int8"))
-out2 = relay.nn.conv2d(out1_relu, w1)
-out2_relu = relay.nn.relu(out2)
+    w1 = relay.var("w1", relay.TensorType((12, 8,3,3), "int8"))
+    out2 = relay.nn.conv2d(out1_relu, w1)
+    out2_relu = relay.nn.relu(out2)
 
-# Wrap into a function and IRModule
-func = relay.Function(relay.analysis.free_vars(out2_relu), out2_relu)
-mod = tvm.IRModule()
-gv1 = relay.GlobalVar("main")
-mod[gv1] = func
+    # Wrap into a function and IRModule
+    func = relay.Function(relay.analysis.free_vars(out2_relu), out2_relu)
+    mod = tvm.IRModule()
+    gv1 = relay.GlobalVar("main")
+    mod[gv1] = func
 
-# Perform tiled lowering
-mod = relay.transform.InferType()(mod)
-lowered_func = lower_tiled(mod[gv1], (1, 2, 16, 16))
+    # Perform tiled lowering
+    mod = relay.transform.InferType()(mod)
+    lowered_func = lower_tiled(mod[gv1], (1, 2, 16, 16), (1,2,3,0))
+
+
+if __name__ == "__main__":
+    test_conv2dreluconv2drelu()
