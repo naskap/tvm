@@ -1,7 +1,9 @@
 import tvm
 from tvm import relay
 from tvm import tir
-# from tvm.driver.build_module import schedule_to_module
+import torch
+from torch.nn.modules.rnn import LSTM
+
 
 # Bring all computations into an outer loop of dimension corresponding to the size of the output
 def schedule_to_outer_loop(sch : tir.Schedule, output_dims : int):
@@ -9,19 +11,22 @@ def schedule_to_outer_loop(sch : tir.Schedule, output_dims : int):
     assert len(sch.get_loops(sch.get_output_blocks("root")[0])) >= output_dims, "{} < {}. ".format(len(sch.get_loops(sch.get_output_blocks("root")[0])), output_dims) + \
                                     "Output block must have at least as many loops as the number of output dimensions specified"
 
+    inlined_blocks = set()
+
     def recursive_helper(block_to_inline : tir.Block):
-        producers = sch.get_producers(block_to_inline)
+
+        if(sch.get(block_to_inline) in inlined_blocks):
+            return
 
         for i in range(output_dims):
             sch.compute_at(block_to_inline, sch.get_loops(sch.get_output_blocks("root")[0])[i])
-        
-        if len(producers) == 0:
-            return
 
-        for producer in producers:
+        inlined_blocks.add(sch.get(block_to_inline))
+
+        for producer in reversed(sch.get_producers(block_to_inline)):
             recursive_helper(producer)
 
-    for output_producer_block in sch.get_producers(sch.get_output_blocks("root")[0]):
+    for output_producer_block in reversed(sch.get_producers(sch.get_output_blocks("root")[0])):
         recursive_helper(output_producer_block)
 
         
@@ -285,21 +290,23 @@ def adjust_for_nested_pipelining_loops(sch : tir.Schedule, out_dims : int):
         inner_loop_rv = outer_loop_rv
 
 
-    import pdb; pdb.set_trace()
-
 
 # Both 'tile_dims' and 'loop_ordering' are with respect to the output shape
 def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : tuple[int] = None) -> tir.PrimFunc:
+    
+
+    assert not isinstance(node.ret_type, tvm.ir.TupleType), "Only single-output nodes supported as it is ambiguous to tile a multi-output node"
+    assert isinstance(node.ret_type, tvm.ir.TensorType)
+    
     out_dims = len(node.ret_type.shape)
     assert len(tile_dims) == out_dims
     assert all([tile_dim > 0 for tile_dim in tile_dims])
     assert isinstance(node, relay.Function)
-    assert not isinstance(node.ret_type, tvm.ir.container.Array), "Only single-output nodes supported (Not sure if there is a legitamite reason to tile a multi-output node in this way)"
    
     if(loop_ordering is None):
-        loop_ordering = tuple(range(len(node.ret_type.shape)))
+        loop_ordering = tuple(range(out_dims))
     
-    assert len(loop_ordering) == len(node.ret_type.shape)
+    assert len(loop_ordering) == out_dims
 
     # Lower Relay function to TensorIR
     cached_func = tvm._ffi.get_global_func("relay.backend.LowerToTE")(node)
@@ -326,7 +333,6 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
     adjust_for_nested_pipelining_loops(sch, out_dims)
 
     # Inject software pipelining
-    
     mod = tir.transform.Simplify()(sch.mod)
     import pdb; pdb.set_trace()
     mod = tir.transform.InjectSoftwarePipeline()(mod)
@@ -336,7 +342,6 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
     return mod["main"]
 
 
-# Define relay graph
 def test_conv2dreluconv2drelu():
     data = relay.var("data", relay.TensorType((1,3,224,224), "int8"))
     w0 = relay.var("w0", relay.TensorType((8,3,3,3), "int8"))
@@ -358,5 +363,31 @@ def test_conv2dreluconv2drelu():
     lowered_func = lower_tiled(mod[gv1], (1, 2, 16, 16), (1,2,3,0))
 
 
+def test_dense_relu_layer_norm():
+    
+    data = relay.var("data", relay.TensorType((4,256,8,8), "float32"))
+    out1 = relay.nn.global_avg_pool2d(data)
+    out1_flat = relay.nn.batch_flatten(out1)
+
+    w0 = relay.var("w0", relay.TensorType((10, 256), "float32"))
+    out2 = relay.nn.dense(out1_flat, w0)
+    out2_smax = relay.nn.softmax(out2)
+
+    # Wrap into a function and IRModule
+    func = relay.Function(relay.analysis.free_vars(out2_smax), out2_smax)
+    mod = tvm.IRModule()
+    gv1 = relay.GlobalVar("main")
+    mod[gv1] = func
+
+
+    # Perform tiled lowering
+    mod = relay.transform.InferType()(mod)
+    mod = relay.transform.SimplifyExpr()(mod)
+    mod = relay.transform.InferType()(mod)
+    lowered_func = lower_tiled(mod[gv1], (1, 10), (0, 1))
+
+
+
 if __name__ == "__main__":
+    test_dense_relu_layer_norm()
     test_conv2dreluconv2drelu()
