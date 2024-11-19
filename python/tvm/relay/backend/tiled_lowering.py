@@ -1,8 +1,7 @@
 import tvm
 from tvm import relay
 from tvm import tir
-import torch
-from torch.nn.modules.rnn import LSTM
+import pytest
 
 
 # Bring all computations into an outer loop of dimension corresponding to the size of the output
@@ -94,16 +93,19 @@ def get_itervar_dependencies(prim_func : tir.PrimFunc):
 #      And our reads from data_in are indexed using ax2_0 and ax3_0
 #      Then we might return in_outidx_deps[data_in] = [ax2_0, ax3_0]
 # Note: Could maybe simplify this by using pass tir.transform.ConvertBlocksToOpaque? 
-def get_input_itervar_dependencies(sch : tir.Schedule) -> dict[tir.Buffer, list[tir.Var]]:
+def get_input_itervar_dependencies(sch : tir.Schedule, in_names : list[str]) -> dict[tir.Buffer, list[tir.Var]]:
     
     # Collect itervars and itervar_deps
-    input_itervars = get_input_itervars(sch.mod["main"], list(sch.mod["main"].buffer_map.values()))
+    # TODO See if there is a less hacky way to get the input variables of a PrimFunc
+    in_buffers = [buf for var, buf in sch.mod["main"].buffer_map.items() if var.name[4:] in in_names]
+    input_itervars = get_input_itervars(sch.mod["main"], in_buffers)
     itervar_deps = get_itervar_dependencies(sch.mod["main"])
     
     # Get mapping from inputs to dependencies
     in_itervar_deps = {}
     for input_var in input_itervars:
         in_itervar_deps[input_var] = []
+
         for itervar in input_itervars[input_var]:
             in_itervar_deps[input_var] += itervar_deps[itervar]
         
@@ -131,12 +133,24 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
         # A cache read needs to be in its own stage
         cur_loop_annotations = sch.get(loop_var).annotations
         if(cur_loop_annotations.get("software_pipeline_stage") is not None):
-            new_stage_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_stage")]
-            sch.unannotate(loop_var, "software_pipeline_stage")
-            new_async_annotation = [0] + [stage + 1 for stage in cur_loop_annotations.get("software_pipeline_async_stages")]
-            sch.unannotate(loop_var, "software_pipeline_async_stages")
+            
+            # Should only be one async read per loop (assuming one compute block)
+            # TODO Right now assumes all async blocks are read based on the order we are calling these functions. We should detect read vs write
+            async_annotations = list(cur_loop_annotations.get("software_pipeline_async_stages"))
+            if async_annotations is not None:
+                assert len(async_annotations) == 1
+                new_async_annotation = async_annotations
+            else:
+                new_async_annotation = [0]
+                sch.unannotate(loop_var, "software_pipeline_async_stages")
+            
             new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
             sch.unannotate(loop_var, "software_pipeline_order")
+
+            # Cache read should belong to asynchronous read stage
+            new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
+            new_stage_annotation.insert(0,new_async_annotation[0])
+            sch.unannotate(loop_var, "software_pipeline_stage")
         else:
             num_stmts_in_loop    = len(sch.get(loop_var).body) 
             new_stage_annotation = [0] + [1 for item in range(num_stmts_in_loop - 1)] # Put cache read in its own stage
@@ -151,12 +165,15 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
 
         for buf_idx, buf_region in enumerate(sch.get(block).reads):
 
-
             # Select only reads from input buffers
             buffer = buf_region.buffer
             if(buffer not in sch_inputs):
                 continue
-            
+
+            # Skip blocks that are cache_reads themselves
+            if(cache_read_injected[buffer] and isinstance(sch.get(block).body, tir.BufferStore)):
+                return
+                        
             assert cache_read_injected[buffer] == False, " Not handled -- two reads from an input buffer"
             
             # Determine where the cache_read should be injected using the dependencies of the itervars of the buffer read
@@ -176,15 +193,13 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
 
 
     def recursive_helper(cur_block : tir.Block):
+
         producers = sch.get_producers(cur_block)
-
-        inject_cache_reads_per_block(cur_block)
-
-        if len(producers) == 0:
-            return
 
         for producer in producers:
             recursive_helper(producer)
+
+        inject_cache_reads_per_block(cur_block)
 
     recursive_helper(sch.get_output_blocks("root")[0])
     assert all([injected for injected in cache_read_injected.values()]), " We missed injecting cache read for at least one buffer {}".format(cache_read_injected)
@@ -231,10 +246,7 @@ def reannotate_nested_pipeline_loops(sch : tir.Schedule, outer_loop_rv : tir.sch
     assert isinstance(outer_loop_stmt.body, tir.SeqStmt)
     inner_loop_stmt_idx = list(outer_loop_stmt.body).index(inner_loop_stmt)
 
-
-    # An n stage pipeline has n-1 prologues, a main body, and n-1 epilogues = 2n-1 total "expanded stages" 
-    num_inner_loop_stages = max(inner_loop_stmt.annotations.get("software_pipeline_stage"))+1 # + 1 for zero indexing
-    num_expanded_pipeline_stages = int(2*num_inner_loop_stages - 1)
+    num_expanded_pipeline_stages = 3 # prologue, body, epilogue (more pipeline stages don't create more expanded stages)
 
     pipeline_order = list(outer_loop_stmt.annotations.get("software_pipeline_order"))
 
@@ -292,9 +304,8 @@ def adjust_for_nested_pipelining_loops(sch : tir.Schedule, out_dims : int):
 
 
 # Both 'tile_dims' and 'loop_ordering' are with respect to the output shape
-def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : tuple[int] = None) -> tir.PrimFunc:
+def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : tuple[int] = None) -> tuple[tir.Schedule, tvm.IRModule]:
     
-
     assert not isinstance(node.ret_type, tvm.ir.TupleType), "Only single-output nodes supported as it is ambiguous to tile a multi-output node"
     assert isinstance(node.ret_type, tvm.ir.TensorType)
     
@@ -327,43 +338,77 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
     tile_outer_loop(sch, tile_dims_reordered)
 
     # Inject cache reads and writes (and associated software pipelining annotations)
-    in_itervar_deps = get_input_itervar_dependencies(sch)
+    in_names = [param.name_hint for param in node.params] 
+    in_itervar_deps = get_input_itervar_dependencies(sch, in_names)
     inject_cache_reads(sch, in_itervar_deps, out_dims)
     inject_cache_write(sch, out_dims)
     adjust_for_nested_pipelining_loops(sch, out_dims)
 
-    # Inject software pipelining
-    mod = tir.transform.Simplify()(sch.mod)
-    import pdb; pdb.set_trace()
-    mod = tir.transform.InjectSoftwarePipeline()(mod)
+    # Apply software pipelining and simplification
+    mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
+    mod = tir.transform.Simplify()(mod)
     
-    mod = tvm.lower(mod)
-    mod = tvm.tir.transform.LoopPartition()(mod) # Not working
-    return mod["main"]
+    # Return schedule in case user wants to modify it
+    return sch, mod
+
+
+@pytest.mark.parametrize("dtype", ["float", "int8"],)
+@pytest.mark.parametrize("in_batch",[1, 6])
+@pytest.mark.parametrize("in_channels", [1, 3])
+@pytest.mark.parametrize("in_H",[8, 224])
+@pytest.mark.parametrize("in_W",[8, 224])
+@pytest.mark.parametrize("out_channels", [8, 15])
+@pytest.mark.parametrize("filter_size", [1, 3])
+@pytest.mark.parametrize("unary_op", [None, relay.nn.relu , relay.tanh])
+@pytest.mark.parametrize("enable_bias", [True, False]) 
+@pytest.mark.parametrize("tile_batch", [1, 3])
+@pytest.mark.parametrize("tile_channels", [2, 8])
+@pytest.mark.parametrize("tile_H", [8, 16])
+@pytest.mark.parametrize("tile_W", [8, 16])
+@pytest.mark.parametrize("loop_ordering", [(0, 1, 2, 3), (3, 2, 1, 0), (0,2,1,3)])
+def test_conv2d(dtype, in_batch, in_channels, in_H, in_W, out_channels, filter_size, unary_op, enable_bias, tile_batch, tile_channels, tile_H, tile_W, loop_ordering):
+    data = relay.var("data", relay.TensorType((in_batch, in_channels, in_H, in_W), dtype))
+    w0 = relay.var("w0", relay.TensorType((out_channels, in_channels, filter_size, filter_size), dtype))
+    out_conv = relay.nn.conv2d(data, w0)
+
+
+    out_H = in_H - (filter_size//2*2)
+    out_W = in_W - (filter_size//2*2)
+    out_dims = (in_batch, out_channels, out_H, out_W)
+    if(enable_bias):
+        bias = relay.var("bias", relay.TensorType((out_channels,), dtype))
+        out_bias = relay.nn.bias_add(out_conv, bias)
+    else:
+        out_bias = out_conv
+    
+    if(unary_op):
+        out = unary_op(out_bias)
+    else:
+        out = out_bias
+    
+    tile_dims = (tile_batch, tile_channels, tile_H, tile_W)
+
+    # Skip invalid tile dims
+    if any(tile_dim > out_dim for tile_dim, out_dim in zip(tile_dims, out_dims)):
+        pytest.skip()
+
+    sch, mod = apply_lower_tiled_to_expr(out, tile_dims, loop_ordering)
 
 
 def test_conv2dreluconv2drelu():
-    data = relay.var("data", relay.TensorType((1,3,224,224), "int8"))
-    w0 = relay.var("w0", relay.TensorType((8,3,3,3), "int8"))
+    data = relay.var("data", relay.TensorType((1,3,224,224), "float16"))
+    w0 = relay.var("w0", relay.TensorType((8,3,3,3), "float16"))
     out1 = relay.nn.conv2d(data, w0)
     out1_relu = relay.nn.relu(out1)
 
-    w1 = relay.var("w1", relay.TensorType((12, 8,3,3), "int8"))
+    w1 = relay.var("w1", relay.TensorType((12, 8,3,3), "float16"))
     out2 = relay.nn.conv2d(out1_relu, w1)
     out2_relu = relay.nn.relu(out2)
 
-    # Wrap into a function and IRModule
-    func = relay.Function(relay.analysis.free_vars(out2_relu), out2_relu)
-    mod = tvm.IRModule()
-    gv1 = relay.GlobalVar("main")
-    mod[gv1] = func
-
-    # Perform tiled lowering
-    mod = relay.transform.InferType()(mod)
-    lowered_func = lower_tiled(mod[gv1], (1, 2, 16, 16), (1,2,3,0))
+    sch, mod = apply_lower_tiled_to_expr(out2_relu, (1, 2, 16, 16), (1,2,3,0))
 
 
-def test_dense_relu_layer_norm():
+def test_avgpool_dense_softmax():
     
     data = relay.var("data", relay.TensorType((4,256,8,8), "float32"))
     out1 = relay.nn.global_avg_pool2d(data)
@@ -373,21 +418,23 @@ def test_dense_relu_layer_norm():
     out2 = relay.nn.dense(out1_flat, w0)
     out2_smax = relay.nn.softmax(out2)
 
-    # Wrap into a function and IRModule
-    func = relay.Function(relay.analysis.free_vars(out2_smax), out2_smax)
+    sch, mod = apply_lower_tiled_to_expr(out2_smax, (1, 10), (0, 1))
+
+# Wrap into a function 
+def apply_lower_tiled_to_expr(expr : relay.expr.RelayExpr, tile_dims : tuple[int], loop_ordering : tuple[int]):
+    
+    func = relay.Function(relay.analysis.free_vars(expr), expr)
+   
+    # Wrap to a module in order to infer type
     mod = tvm.IRModule()
     gv1 = relay.GlobalVar("main")
     mod[gv1] = func
-
-
-    # Perform tiled lowering
     mod = relay.transform.InferType()(mod)
-    mod = relay.transform.SimplifyExpr()(mod)
-    mod = relay.transform.InferType()(mod)
-    lowered_func = lower_tiled(mod[gv1], (1, 10), (0, 1))
 
+    sch, mod_lowered = lower_tiled(mod[gv1], tile_dims, loop_ordering)
+    return sch, mod_lowered
 
 
 if __name__ == "__main__":
-    test_dense_relu_layer_norm()
+    test_avgpool_dense_softmax()
     test_conv2dreluconv2drelu()
