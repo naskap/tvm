@@ -2,10 +2,10 @@ import tvm
 from tvm import relay
 from tvm import tir
 import pytest
-
+from types import UnionType
 
 # Bring all computations into an outer loop of dimension corresponding to the size of the output
-def schedule_to_outer_loop(sch : tir.Schedule, output_dims : int):
+def schedule_to_outer_loops(sch : tir.Schedule, output_dims : int):
     
     assert len(sch.get_loops(sch.get_output_blocks("root")[0])) >= output_dims, "{} < {}. ".format(len(sch.get_loops(sch.get_output_blocks("root")[0])), output_dims) + \
                                     "Output block must have at least as many loops as the number of output dimensions specified"
@@ -88,7 +88,7 @@ def get_itervar_dependencies(prim_func : tir.PrimFunc):
 
     return itervar_tiling_dependencies
 
-# Return a mapping from each input to the given schedule, to its itervar dependencies 
+# Return a mapping from each input in the given schedule, to its itervar dependencies 
 # e.g. If we have the following outer tiling loops : for ax0_0, ax1_0, ax2_0, ax3_0 in T.grid(1, 6, 14, 14):
 #      And our reads from data_in are indexed using ax2_0 and ax3_0
 #      Then we might return in_outidx_deps[data_in] = [ax2_0, ax3_0]
@@ -114,51 +114,84 @@ def get_input_itervar_dependencies(sch : tir.Schedule, in_names : list[str]) -> 
 
     return in_itervar_deps
 
+# Return a mapping from each input in the given schedule, to the smallest index of the tiling loop that it must be fetched under
+#      where tiling loops are indexed with the most outer loop being 0
+# e.g. If we have the following tiling loops : for ax0_0, ax1_0, ax2_0, ax3_0 in T.grid(...):
+#      And our reads from data_in are indexed using ax1_0 and ax2_0
+#      Then our max restriction will be 1 corresponding to ax2_0
+def get_input_itervar_restrictions(sch : tir.Schedule, in_names : list[str], out_dims : int) -> dict[tir.Buffer, int]:
+    
+    in_itervar_deps = get_input_itervar_dependencies(sch, in_names)
+    
+    # Get tiling variable restrictions from input itervar dependencies
+    in_itervar_restrictions = {}
+    outer_loop_rvs = [sch.get_loops(sch.get_output_blocks("root")[0])[i] for i in range(out_dims)] 
+    outer_loop_vars = [sch.get(loop_rv).loop_var for loop_rv in outer_loop_rvs]
+    for buffer in in_itervar_deps.keys():
+        cur_max_restriction = -1
+        for itervar_dep in in_itervar_deps[buffer]:
+
+            if(itervar_dep in outer_loop_vars):
+                cur_max_restriction = max(cur_max_restriction, outer_loop_vars.index(itervar_dep))
+
+        in_itervar_restrictions[buffer] = cur_max_restriction
+
+    return in_itervar_restrictions
 
 
-def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, list[tir.Var]], output_dims : int):
+def inject_cache_reads(sch : tir.Schedule, 
+                       in_itervar_restrictions : dict[tir.Buffer, int], 
+                       in_buffers_to_async_pipeline : list[tir.Buffer], 
+                       output_dims : int):
     
     # Define helper vars
-    sch_inputs = list(in_itervar_deps.keys()) 
+    sch_inputs = list(in_itervar_restrictions.keys()) 
     cache_read_injected = {in_data : False for in_data in sch_inputs}
 
     # Each loop has a "loop_var" of type tir.Var used for iteration
     # Each loop has a "loop_rv" of type tir.schedule.LoopRV used to refer to loops during scheduling
     outer_loop_rvs = [sch.get_loops(sch.get_output_blocks("root")[0])[i] for i in range(output_dims)] 
-    outer_loop_vars = [sch.get(loop_rv).loop_var for loop_rv in outer_loop_rvs]
 
-    def add_pipeline_annotations_for_cache_read(loop_var : tir.schedule.LoopRV):
-        
+    def add_pipeline_annotations_for_cache_read(loop_var : tir.schedule.LoopRV, async_pipeline : bool, buf_idx):
         
         # A cache read needs to be in its own stage
         cur_loop_annotations = sch.get(loop_var).annotations
         if(cur_loop_annotations.get("software_pipeline_stage") is not None):
             
-            # Should only be one async read per loop (assuming one compute block)
-            # TODO Right now assumes all async blocks are read based on the order we are calling these functions. We should detect read vs write
-            async_annotations = list(cur_loop_annotations.get("software_pipeline_async_stages"))
-            if async_annotations is not None:
+            if(async_pipeline):
+                # Should only be one async read per loop (assuming one compute block)
+                # TODO Right now assumes all async blocks are read based on the order we are calling these functions. We should detect read vs write
+                async_annotations = list(cur_loop_annotations.get("software_pipeline_async_stages"))
+                
+                
+                # if async_annotations is not None:
                 assert len(async_annotations) == 1
                 new_async_annotation = async_annotations
-            else:
-                new_async_annotation = [0]
-                sch.unannotate(loop_var, "software_pipeline_async_stages")
-            
-            new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
-            sch.unannotate(loop_var, "software_pipeline_order")
+                # else:
+                #     new_async_annotation = [0]
+                #     sch.unannotate(loop_var, "software_pipeline_async_stages")
+                
+                new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
+                sch.unannotate(loop_var, "software_pipeline_order")
 
-            # Cache read should belong to asynchronous read stage
-            new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
-            new_stage_annotation.insert(0,new_async_annotation[0])
-            sch.unannotate(loop_var, "software_pipeline_stage")
+                # Cache read should belong to asynchronous read stage
+                new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
+                new_stage_annotation.insert(0,new_async_annotation[0])
+                sch.unannotate(loop_var, "software_pipeline_stage")
+            else:
+                new_order_annotation = [0] + [order + 1 for order in cur_loop_annotations.get("software_pipeline_order")]
+                new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
+                new_stage_annotation.insert(buf_idx, 1)
+                sch.unannotate(loop_var, "software_pipeline_order")
+                sch.unannotate(loop_var, "software_pipeline_stage")
         else:
             num_stmts_in_loop    = len(sch.get(loop_var).body) 
             new_stage_annotation = [0] + [1 for item in range(num_stmts_in_loop - 1)] # Put cache read in its own stage
             new_async_annotation = [0] # cache read stage should be asynchronous
             new_order_annotation = list(range(num_stmts_in_loop)) # Compute everything in order
+            sch.annotate(loop_var, "software_pipeline_async_stages", new_async_annotation)
             
         sch.annotate(loop_var, "software_pipeline_stage", new_stage_annotation)
-        sch.annotate(loop_var, "software_pipeline_async_stages", new_async_annotation)
         sch.annotate(loop_var, "software_pipeline_order", new_order_annotation)
 
     def inject_cache_reads_per_block(block : tir.Block):
@@ -176,18 +209,14 @@ def inject_cache_reads(sch : tir.Schedule, in_itervar_deps : dict[tir.Buffer, li
                         
             assert cache_read_injected[buffer] == False, " Not handled -- two reads from an input buffer"
             
-            # Determine where the cache_read should be injected using the dependencies of the itervars of the buffer read
-            cur_max_restriction = -1
-            for itervar_dep in in_itervar_deps[buffer]:
-
-                if(itervar_dep in outer_loop_vars):
-                    cur_max_restriction = max(cur_max_restriction, outer_loop_vars.index(itervar_dep))
-
             # Inject cache read
             cache_block = sch.cache_read(block, buf_idx, storage_scope='local')
-            if(cur_max_restriction != -1):
-                sch.compute_at(cache_block, outer_loop_rvs[cur_max_restriction]) # Move cache read to location found above
-                add_pipeline_annotations_for_cache_read(outer_loop_rvs[cur_max_restriction]) 
+            if(in_itervar_restrictions[buffer] != -1):
+                loop_rv = outer_loop_rvs[in_itervar_restrictions[buffer]]
+                sch.compute_at(cache_block, loop_rv) # Move cache read to location found above
+                async_pipeline = buffer in in_buffers_to_async_pipeline
+                add_pipeline_annotations_for_cache_read(loop_rv, async_pipeline, buf_idx) 
+                
 
             cache_read_injected[buffer] = True
 
@@ -216,12 +245,13 @@ def inject_cache_write(sch : tir.Schedule, out_dims : int):
     cur_loop_annotations = sch.get(inner_tiling_loop).annotations
     if(cur_loop_annotations.get("software_pipeline_stage") is not None):
         new_stage_annotation = list(cur_loop_annotations.get("software_pipeline_stage"))
-        new_stage = max(new_stage_annotation) + 1
-        new_stage_annotation.append(new_stage)
+        compute_write_stage = max(new_stage_annotation)
+        new_stage_annotation.append(compute_write_stage)
         sch.unannotate(inner_tiling_loop, "software_pipeline_stage")
 
         new_async_annotation = list(cur_loop_annotations.get("software_pipeline_async_stages"))
-        new_async_annotation.append(new_stage)
+        new_async_annotation.append(compute_write_stage)
+        new_async_annotation = [compute_write_stage]
         sch.unannotate(inner_tiling_loop, "software_pipeline_async_stages")
 
         new_order_annotation = list(cur_loop_annotations.get("software_pipeline_order"))
@@ -230,8 +260,8 @@ def inject_cache_write(sch : tir.Schedule, out_dims : int):
 
     else:
         num_stmts_in_loop = len(sch.get(inner_tiling_loop).body)
-        new_stage_annotation = [0 for item in range(num_stmts_in_loop - 1)] + [1] # Put cache_write in its own stage
-        new_async_annotation = [1] # Make cache_write asynchronous
+        new_stage_annotation = [0 for item in range(num_stmts_in_loop)] # Put cache_write in its own stage
+        new_async_annotation = [0] # Make cache_write asynchronous
         new_order_annotation = list(range(num_stmts_in_loop)) # Compute all stmts in order
         
     sch.annotate(inner_tiling_loop, "software_pipeline_stage", new_stage_annotation)
@@ -304,7 +334,11 @@ def adjust_for_nested_pipelining_loops(sch : tir.Schedule, out_dims : int):
 
 
 # Both 'tile_dims' and 'loop_ordering' are with respect to the output shape
-def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : tuple[int] = None) -> tuple[tir.Schedule, tvm.IRModule]:
+# async_dma option defines whether data movement commands should be software pipelined 
+def LowerTiled(node : relay.Function, 
+               tile_dims : tuple[int], 
+               loop_ordering : tuple[int] = None, 
+               data_to_async_pipeline : list[str] = None) -> tir.Schedule:
     
     assert not isinstance(node.ret_type, tvm.ir.TupleType), "Only single-output nodes supported as it is ambiguous to tile a multi-output node"
     assert isinstance(node.ret_type, tvm.ir.TensorType)
@@ -326,7 +360,7 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
     sch = tir.Schedule(tvm.te.create_prim_func(inputs + [output]))
 
     # Bring all computation into outer loop corresponding to size of output
-    schedule_to_outer_loop(sch, out_dims)
+    schedule_to_outer_loops(sch, out_dims)
 
     # Reorder outer loops to desired order
     outer_loops = sch.get_loops(sch.get_output_blocks("root")[0])[:out_dims]
@@ -337,19 +371,29 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
     tile_dims_reordered = [tile_dims[i] for i in loop_ordering] 
     tile_outer_loop(sch, tile_dims_reordered)
 
+    # Determine input itervar restrictions and which buffers to pipeline
+    in_names = [param.name_hint for param in node.params]
+    in_itervar_restrictions = get_input_itervar_restrictions(sch, in_names, out_dims)
+    if(data_to_async_pipeline is None):
+        in_buffers_to_async_pipeline = [buffer for buffer, restriction in in_itervar_restrictions.items() if restriction==out_dims-1]
+    else:
+        in_buffers_to_async_pipeline = []
+        for var, buf in sch.mod["main"].buffer_map.items():
+            if(var.name[4:] in data_to_async_pipeline):
+                in_buffers_to_async_pipeline.append(buf)
+                data_to_async_pipeline.remove(var.name[4:])
+
+        assert len(data_to_async_pipeline) == 0 , "Not all data_to_async_pipeline found in the graph. Entries not found: {}".format(data_to_async_pipeline)
+
+
     # Inject cache reads and writes (and associated software pipelining annotations)
-    in_names = [param.name_hint for param in node.params] 
-    in_itervar_deps = get_input_itervar_dependencies(sch, in_names)
-    inject_cache_reads(sch, in_itervar_deps, out_dims)
+    inject_cache_reads(sch, in_itervar_restrictions, in_buffers_to_async_pipeline, out_dims)
     inject_cache_write(sch, out_dims)
+
     adjust_for_nested_pipelining_loops(sch, out_dims)
 
-    # Apply software pipelining and simplification
-    mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
-    mod = tir.transform.Simplify()(mod)
-    
     # Return schedule in case user wants to modify it
-    return sch, mod
+    return sch
 
 
 @pytest.mark.parametrize("dtype", ["float", "int8"],)
@@ -359,22 +403,30 @@ def lower_tiled(node : relay.Function, tile_dims : tuple[int], loop_ordering : t
 @pytest.mark.parametrize("in_W",[8, 224])
 @pytest.mark.parametrize("out_channels", [8, 15])
 @pytest.mark.parametrize("filter_size", [1, 3])
+@pytest.mark.parametrize("padding", [(0,0)])
 @pytest.mark.parametrize("unary_op", [None, relay.nn.relu , relay.tanh])
 @pytest.mark.parametrize("enable_bias", [True, False]) 
 @pytest.mark.parametrize("tile_batch", [1, 3])
 @pytest.mark.parametrize("tile_channels", [2, 8])
 @pytest.mark.parametrize("tile_H", [8, 16])
 @pytest.mark.parametrize("tile_W", [8, 16])
-@pytest.mark.parametrize("loop_ordering", [(0, 1, 2, 3), (3, 2, 1, 0), (0,2,1,3)])
-def test_conv2d(dtype, in_batch, in_channels, in_H, in_W, out_channels, filter_size, unary_op, enable_bias, tile_batch, tile_channels, tile_H, tile_W, loop_ordering):
-    data = relay.var("data", relay.TensorType((in_batch, in_channels, in_H, in_W), dtype))
-    w0 = relay.var("w0", relay.TensorType((out_channels, in_channels, filter_size, filter_size), dtype))
-    out_conv = relay.nn.conv2d(data, w0)
-
-
+@pytest.mark.parametrize("loop_ordering", [(0, 1, 2, 3), (3, 2, 1, 0), (0, 2, 1, 3)])
+def test_conv2d(dtype, in_batch, in_channels, in_H, in_W, out_channels, filter_size, padding, unary_op, enable_bias, tile_batch, tile_channels, tile_H, tile_W, loop_ordering):
+    
+    tile_dims = (tile_batch, tile_channels, tile_H, tile_W)
     out_H = in_H - (filter_size//2*2)
     out_W = in_W - (filter_size//2*2)
     out_dims = (in_batch, out_channels, out_H, out_W)
+
+    # Skip invalid tile dims
+    if any(tile_dim > out_dim for tile_dim, out_dim in zip(tile_dims, out_dims)):
+        pytest.skip()
+    
+    # Build expr
+    data = relay.var("data", relay.TensorType((in_batch, in_channels, in_H, in_W), dtype))
+    w0 = relay.var("w0", relay.TensorType((out_channels, in_channels, filter_size, filter_size), dtype))
+    out_conv = relay.nn.conv2d(data, w0, padding=padding)
+
     if(enable_bias):
         bias = relay.var("bias", relay.TensorType((out_channels,), dtype))
         out_bias = relay.nn.bias_add(out_conv, bias)
@@ -386,13 +438,8 @@ def test_conv2d(dtype, in_batch, in_channels, in_H, in_W, out_channels, filter_s
     else:
         out = out_bias
     
-    tile_dims = (tile_batch, tile_channels, tile_H, tile_W)
 
-    # Skip invalid tile dims
-    if any(tile_dim > out_dim for tile_dim, out_dim in zip(tile_dims, out_dims)):
-        pytest.skip()
-
-    sch, mod = apply_lower_tiled_to_expr(out, tile_dims, loop_ordering)
+    mod = apply_lower_tiled_to_expr(out, tile_dims, loop_ordering)
 
 
 def test_conv2dreluconv2drelu():
@@ -405,7 +452,7 @@ def test_conv2dreluconv2drelu():
     out2 = relay.nn.conv2d(out1_relu, w1)
     out2_relu = relay.nn.relu(out2)
 
-    sch, mod = apply_lower_tiled_to_expr(out2_relu, (1, 2, 16, 16), (1,2,3,0))
+    mod = apply_lower_tiled_to_expr(out2_relu, (1, 2, 16, 16), (1,2,3,0))
 
 
 def test_avgpool_dense_softmax():
@@ -417,11 +464,26 @@ def test_avgpool_dense_softmax():
     w0 = relay.var("w0", relay.TensorType((10, 256), "float32"))
     out2 = relay.nn.dense(out1_flat, w0)
     out2_smax = relay.nn.softmax(out2)
+    
 
-    sch, mod = apply_lower_tiled_to_expr(out2_smax, (1, 10), (0, 1))
+    mod = apply_lower_tiled_to_expr(out2_smax, (1, 10), (0, 1))
+
+def test_dense_bias():
+    
+    data = relay.var("data", relay.TensorType((256,256), "float32"))
+    w0 = relay.var("w0", relay.TensorType((256, 256), "float32"))
+    bias = relay.var("bias", relay.TensorType((256,256), "float32"))
+    out_dense = relay.nn.dense(data, w0)
+    out_bias = relay.add(out_dense, bias)
+    
+
+    mod = apply_lower_tiled_to_expr(out_bias, (32, 32), (1, 0), ["data"])
 
 # Wrap into a function 
-def apply_lower_tiled_to_expr(expr : relay.expr.RelayExpr, tile_dims : tuple[int], loop_ordering : tuple[int]):
+def apply_lower_tiled_to_expr(expr : relay.expr.RelayExpr, 
+                              tile_dims : tuple[int], 
+                              loop_ordering : tuple[int] = None, 
+                              data_to_async_pipeline : list[str] = None):
     
     func = relay.Function(relay.analysis.free_vars(expr), expr)
    
@@ -431,8 +493,10 @@ def apply_lower_tiled_to_expr(expr : relay.expr.RelayExpr, tile_dims : tuple[int
     mod[gv1] = func
     mod = relay.transform.InferType()(mod)
 
-    sch, mod_lowered = lower_tiled(mod[gv1], tile_dims, loop_ordering)
-    return sch, mod_lowered
+    sch = LowerTiled(mod[gv1], tile_dims, loop_ordering, data_to_async_pipeline)
+    mod = tir.transform.InjectSoftwarePipeline()(sch.mod)
+    
+    return mod
 
 
 if __name__ == "__main__":
