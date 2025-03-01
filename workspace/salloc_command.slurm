@@ -1,0 +1,1 @@
+salloc --nodes=1 --ntasks=1 --mem=4G --time=00:20:00 --gres=gpu:1 --mail-type=begin --mail-user=nk2747@princeton.edu --constraint=v100
