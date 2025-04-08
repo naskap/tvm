@@ -26,15 +26,14 @@ from tvm.meta_schedule.testing.te_workload import create_te_workload
 from tvm.support import describe
 from tvm.testing.utils import strtobool
 from tvm.meta_schedule.testing.local_rpc import LocalRPC
-
+import print_schedule_space
+from tvm.meta_schedule.testing import te_workload
+from tvm import te
+from utils import kernel_gen_add_schedule
+from rl_search import RLSearch
 
 def _parse_args():
     args = argparse.ArgumentParser()
-    args.add_argument(
-        "--workload",
-        type=str,
-        required=True,
-    )
     args.add_argument(
         "--num-trials",
         type=int,
@@ -95,7 +94,6 @@ ARGS = _parse_args()
 
 def main():
     describe()
-    print(f"Workload: {ARGS.workload}")
     with ms.Profiler() as profiler:
         with LocalRPC() as rpc:
             rpc_runner = ms.runner.RPCRunner(
@@ -113,8 +111,31 @@ def main():
                 alloc_repeat=3
             )
 
-            workload = create_te_workload(ARGS.workload, 0)
+            f = tvm.get_global_func("kernel_gen_add_schedule")
+            print(f)
+
+            workload =  te.create_prim_func(
+                            te_workload.conv2d_nchw_bias_bn_relu(
+                                n=12,
+                                h=128,
+                                w=136,
+                                ci=4,
+                                co=8,
+                                kh=3,
+                                kw=3,
+                                stride=2,
+                                padding=0,
+                                dilation=0,
+                                in_dtype="float16",
+                                out_dtype="float32",
+                            )
+                        )
+            
             target = ARGS.target
+            
+            # print_schedule_space.print_sketches_for_workload(workload)
+            # import pdb; pdb.set_trace()
+
             db : Optional[tir.Schedule] = ms.tir_integration.tune_tir(
                 mod=ms.tir_integration._normalize_mod(workload),
                 target=ARGS.target,
@@ -126,7 +147,7 @@ def main():
                     extractor=ms.feature_extractor.PerStoreFeature(),
                     adaptive_training=ARGS.adaptive_training,
                 ),
-                strategy=ms.search_strategy.EvolutionarySearch(),
+                strategy=RLSearch(),
             )
             sch = ms.tir_integration.compile_tir(db, workload, target)
 

@@ -190,7 +190,9 @@ class SearchStrategy(Object):
             EvolutionarySearch,
             ReplayFunc,
             ReplayTrace,
+            RLSearch
         )
+        import pdb; pdb.set_trace()
 
         if kind == "evolutionary":
             return EvolutionarySearch(*args, **kwargs)
@@ -198,6 +200,7 @@ class SearchStrategy(Object):
             return ReplayTrace(*args, **kwargs)
         if kind == "replay-func":
             return ReplayFunc(*args, **kwargs)  # type: ignore
+        
         raise ValueError(f"Unknown SearchStrategy: {kind}")
 
 

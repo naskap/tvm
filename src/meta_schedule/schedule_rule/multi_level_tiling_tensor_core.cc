@@ -20,11 +20,15 @@
 #include <tvm/tir/op.h>
 
 #include <algorithm>
+#include <iostream>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "../utils.h"
 #include "./multi_level_tiling.h"
+#include "tvm/runtime/container/map.h"
+#include "tvm/runtime/registry.h"
 
 namespace tvm {
 namespace meta_schedule {
@@ -224,6 +228,10 @@ Array<Schedule> MultiLevelTilingTensorCoreNode::Apply(const Schedule& sch,
   // fail.
   Schedule original_sch = sch;
 
+  auto kernel_gen_add_schedule = tvm::runtime::Registry::Get("kernel_gen_add_schedule");
+
+  std::cout << "Checkpoint 1" << kernel_gen_add_schedule << "\n";
+  int sched_num = 0;
   std::vector<State> initial_states;
   for (const auto& kv : intrin_group_to_mapping_info) {
     const TensorCoreIntrinGroup& intrin_group = intrin_groups[kv.first];
@@ -231,6 +239,24 @@ Array<Schedule> MultiLevelTilingTensorCoreNode::Apply(const Schedule& sch,
     Schedule new_sch = sch->Copy();
     new_sch->Annotate(block_rv, tir::attr::meta_schedule_tiling_structure, structure);
     initial_states.push_back(TensorCoreState(intrin_group, mapping_info, new_sch, block_rv, true));
+
+    std::string compute_intrin_str = std::string(intrin_group.compute_intrin.c_str());
+    std::cout << "Checkpoint 2" << "\n";
+    std::string sched_key;
+    if (compute_intrin_str.find("wmma") != std::string::npos) {
+      sched_key = "wmma";
+    } else if (compute_intrin_str.find("mma") != std::string::npos) {
+      sched_key = "mma";
+    } else {
+      sched_key = "none";
+    }
+    std::cout << "Checkpoint 3" << "\n";
+    tvm::runtime::Map<String, String> sched_attributes = {
+        {"wmma/mma/none", sched_key},
+        {"transpose", compute_intrin_str.find("trans") != std::string::npos ? "true" : "false"}};
+
+    std::cout << "Checkpoint 4" << "\n";
+    (*kernel_gen_add_schedule)(sched_num++, sched_attributes);
   }
   Array<Schedule> results;
   for (auto&& state : ApplySubRules(initial_states)) {
@@ -321,6 +347,7 @@ std::vector<State> MultiLevelTilingTensorCoreNode::MMAAddReadReuse(TensorCoreSta
 std::pair<Array<tir::ExprRV>, Array<tir::LoopRV>> MultiLevelTilingTensorCoreNode::MMASplitLoop(
     const Schedule& sch, BlockRV block, LoopRV loop, int n_tiles, int partition_pos,
     int innerpart_factor) const {
+  // Add sampling to schedule and then split based on the results
   Array<tir::ExprRV> factors = sch->SamplePartitionedTile(
       /*loop=*/loop,
       /*n=*/n_tiles,
@@ -340,20 +367,34 @@ std::vector<State> MultiLevelTilingTensorCoreNode::MMATileLoopNest(TensorCoreSta
     LOG(DEBUG) << "The MMA tensor core only supports SSR loops now";
     return {};
   }
+
+  // returns a vector containing the iteration variable types
   std::vector<IterVarType> iter_types = GetBlockVarTypes(sch->GetSRef(state->block_rv));
   ICHECK_EQ(loops.size(), iter_types.size());
+
   // Step 2. For each loop axis, tile it
   int64_t spatial_loop_product = 1;
-  std::vector<Array<LoopRV>> tiles(s_indices_.size() + r_indices_.size());
+
+  // s_indices and r_indices correspond to the structure string passed in
+  // SSSRRSRS results in s_indices = {0,1,2,5,7}
+  // S stands for spatial and R stands for reduction
+  // Spatially tiling is normal tiling
+  // Reduction tiling tiles reduction in a way that matches the hardware
+  std::vector<Array<LoopRV>> tiles(s_indices_.size() +
+                                   r_indices_.size());  // Corresponds to LoopRV's to be tiled
   state->tile_factors.resize(tiles.size());
   std::vector<Array<tir::ExprRV>> tile_factors;
   tile_factors.resize(tiles.size());
+
+  // Iterate through the loops
   for (int i = 0, n = loops.size(); i < n; ++i) {
     LoopRV loop = loops[i];
     const std::vector<int>* idx = nullptr;
 
     if (iter_types[i] == IterVarType::kDataPar) {
       idx = &s_indices_;
+
+      // Keep product of spatial loops, unless one is not found
       if (spatial_loop_product != -1) {
         if (const int64_t* extent = tir::GetLoopIntExtent(sch->Get(loop).get())) {
           spatial_loop_product *= *extent;
