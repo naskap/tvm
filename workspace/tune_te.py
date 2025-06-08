@@ -29,8 +29,22 @@ from tvm.meta_schedule.testing.local_rpc import LocalRPC
 import print_schedule_space
 from tvm.meta_schedule.testing import te_workload
 from tvm import te
-from utils import kernel_gen_add_schedule
-from rl_search import RLSearch
+from rl_search import RLSearch, kernel_gen_add_schedule
+from tvm.relax.frontend.torch import from_fx
+
+
+import os
+import numpy as np
+import torch
+from torch.export import export
+from tvm import relax
+from tvm.relax.frontend.torch import from_exported_program
+from torchvision.models.convnext import ConvNeXt_Tiny_Weights, convnext_tiny
+import onnx
+import tempfile
+from tvm.relax.frontend.onnx import from_onnx
+import torchvision.models as models
+
 
 def _parse_args():
     args = argparse.ArgumentParser()
@@ -92,8 +106,10 @@ logging.getLogger("tvm.meta_schedule").setLevel(logging.DEBUG)
 ARGS = _parse_args()
 
 
+
 def main():
     describe()
+
     with ms.Profiler() as profiler:
         with LocalRPC() as rpc:
             rpc_runner = ms.runner.RPCRunner(
@@ -111,8 +127,17 @@ def main():
                 alloc_repeat=3
             )
 
-            f = tvm.get_global_func("kernel_gen_add_schedule")
-            print(f)
+
+
+            # # Export VGG11 to ONNX
+            # convnext = models.convnext.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT).eval()
+            # dummy_input = torch.randn(1, 3, 224, 224)
+
+            # # Import the model into TVM Relax using from_fx
+            # traced = torch.fx.symbolic_trace(convnext)
+            # mod = from_fx(traced, [((1,3,224,224),"float16")])
+
+            # mod = relax.get_pipeline("default_build")(mod)
 
             workload =  te.create_prim_func(
                             te_workload.conv2d_nchw_bias_bn_relu(
@@ -127,28 +152,93 @@ def main():
                                 padding=0,
                                 dilation=0,
                                 in_dtype="float16",
-                                out_dtype="float32",
                             )
                         )
             
             target = ARGS.target
-            
-            # print_schedule_space.print_sketches_for_workload(workload)
-            # import pdb; pdb.set_trace()
+
+            print_schedule_space.print_sketches_for_workload(workload)
+
+            feature_config = {} # Shared arguments for PerStoreFeatuer and RLModel
+
+            from rl_model import TVMEnv
+            env = TVMEnv()
+            from tvm.meta_schedule.builder import Builder
+            from tvm.meta_schedule.utils import cpu_count
+            cpus = cpu_count(logical=False)
+            builder = Builder.create(builder, max_workers=cpus)
+            rpc_runner
 
             db : Optional[tir.Schedule] = ms.tir_integration.tune_tir(
-                mod=ms.tir_integration._normalize_mod(workload),
+                mod=workload,
                 target=ARGS.target,
                 work_dir=ARGS.work_dir,
                 max_trials_global=ARGS.num_trials,
                 num_trials_per_iter=64,
                 runner=rpc_runner,
                 cost_model=ms.cost_model.XGBModel(  # type: ignore
-                    extractor=ms.feature_extractor.PerStoreFeature(),
+                    extractor=ms.feature_extractor.PerStoreFeature(**feature_config),
                     adaptive_training=ARGS.adaptive_training,
                 ),
                 strategy=RLSearch(),
             )
+
+
+            # Copied from tune_tir -- build TuneContext at a higher scope
+            # 
+            if isinstance(mod, tir.PrimFunc):
+                mod = _normalize_mod(mod)
+
+            named_tasks: List[Tuple[str, tir.PrimFunc]] = []
+            for gv, func in mod.functions_items():  # pylint: disable=invalid-name
+                if isinstance(func, tir.PrimFunc):
+                    named_tasks.append((gv.name_hint, func))
+            named_tasks.sort(key=lambda x: x[0])
+
+            task_names = [x for x, _ in named_tasks]
+            tasks: List[TuneContext] = []
+            for task_name, task_func, logger, rand_state in zip(
+                task_names,
+                [x for _, x in named_tasks],
+                get_loggers_from_work_dir(work_dir, task_names),
+                fork_seed(seed, n=len(named_tasks)),
+            ):
+                if special_space and task_name in special_space:
+                    task_space = special_space[task_name]
+                else:
+                    task_space = space
+                if task_space is None:
+                    continue
+                tasks.append(
+                    TuneContext(
+                        mod=task_func,
+                        target=target,
+                        space_generator=task_space,
+                        search_strategy=strategy,
+                        task_name=task_name,
+                        rand_state=rand_state,
+                        num_threads=num_tuning_cores,
+                        logger=logger,
+                    ).clone()
+                )
+            ms.tir_integration.tune_tasks(
+            tasks=tasks,
+            task_weights=[1.0],
+            work_dir=ARGS.work_dir,
+            max_trials_global=ARGS.num_trials,
+            max_trials_per_task=max_trials_per_task,
+            num_trials_per_iter=num_trials_per_iter,
+            builder=builder,
+            runner=runner,
+            database=database,
+            cost_model=cost_model,
+            measure_callbacks=measure_callbacks,
+            task_scheduler=task_scheduler,
+            module_equality=module_equality,
+            post_optimization=post_optimization,
+        )
+
+
             sch = ms.tir_integration.compile_tir(db, workload, target)
 
     print("Tuning Time:")

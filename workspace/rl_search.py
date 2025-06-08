@@ -15,20 +15,35 @@
 # specific language governing permissions and limitations
 # under the License.
 """Evolutionary Search Strategy"""
-from tvm._ffi import register_object
-
-from tvm.meta_schedule import _ffi_api
 from tvm.meta_schedule.search_strategy.search_strategy import PySearchStrategy, MeasureCandidate
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 from tvm.tir.schedule import Schedule
 from tvm.meta_schedule.utils import derived_object
+import tvm
+import tvm._ffi
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+
+attributes_schedule : list[dict] = [] # Each index corresponds to a schedule
+
+@tvm._ffi.register_func("kernel_gen_add_schedule")
+def kernel_gen_add_schedule(idx, attributes : dict):
+    if(idx < len(attributes_schedule) and idx >=0):
+        attributes_schedule[idx].update(dict(attributes))
+    else:
+        assert (idx == len(attributes_schedule)), "idx is {} but len(attributes_schedule) is {}".format(idx, len(attributes_schedule))
+        attributes_schedule.append(dict(attributes))
+
+    print(attributes_schedule)
+
+
 
 
 @derived_object
 class RLSearch(PySearchStrategy):
 
-    def __init__(self):
-        pass
+    def __init__(self, model):
+        self.model = model
 
     def _initialize_with_tune_context(self, context: "TuneContext") -> None:
         pass
@@ -48,8 +63,7 @@ class RLSearch(PySearchStrategy):
         design_spaces : List[Schedule]
             The design spaces for pre-tuning.
         """
-        import pdb; pdb.set_trace()
-        raise NotImplementedError
+        pass # Implementing generate_measure_candidates first and then can see if any pre-tuning needs to be done
 
     def post_tuning(self):
         pass
