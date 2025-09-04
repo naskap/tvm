@@ -190,9 +190,7 @@ class SearchStrategy(Object):
             EvolutionarySearch,
             ReplayFunc,
             ReplayTrace,
-            RLSearch
         )
-        import pdb; pdb.set_trace()
 
         if kind == "evolutionary":
             return EvolutionarySearch(*args, **kwargs)
