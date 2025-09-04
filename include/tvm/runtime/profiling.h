@@ -589,6 +589,10 @@ PackedFunc WrapTimeEvaluator(PackedFunc f, Device dev, int number, int repeat, i
                              int repeats_to_cooldown, int cache_flush_bytes = 0,
                              PackedFunc f_preproc = nullptr);
 
+PackedFunc WrapPowerEvaluator(PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
+                             int limit_zero_time_iterations, int cooldown_interval_ms,
+                             int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc);
+
 }  // namespace profiling
 }  // namespace runtime
 }  // namespace tvm

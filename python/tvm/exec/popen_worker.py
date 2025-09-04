@@ -24,7 +24,6 @@ import traceback
 import pickle
 import logging
 import cloudpickle
-
 from tvm.contrib.popen_pool import StatusKind
 
 
@@ -36,12 +35,15 @@ class TimeoutStatus:
 
 
 def main():
+    import faulthandler
+    faulthandler.enable()
+    
     """Main worker function"""
     if len(sys.argv) != 3:
         print("Usage: <read_fd> <write_fd>")
         return
     if sys.platform == "win32":
-        # pylint: disable=import-outside-toplevel
+        # pylint: disable=import-outside-toplevel        
         import msvcrt
 
         reader = os.fdopen(msvcrt.open_osfhandle(int(sys.argv[1]), os.O_BINARY), "rb")
@@ -51,7 +53,6 @@ def main():
         writer = os.fdopen(int(sys.argv[2]), "wb")
 
     logging.basicConfig(level=logging.INFO)
-
     lock = threading.Lock()
 
     def _respond(ret_value):

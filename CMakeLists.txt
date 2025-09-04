@@ -880,3 +880,21 @@ if (USE_FLASHINFER STREQUAL "ON")
   target_link_libraries(tvm PRIVATE flashinfer_tvm)
   target_link_libraries(tvm_runtime PRIVATE flashinfer_tvm)
 endif ()
+
+
+# find_path(NVML_INCLUDE_DIR )
+# find_library(NVML_LIBRARY NAMES )
+# message(STATUS "NVML_INCLUDE_DIR: ${NVML_INCLUDE_DIR}")
+# message(STATUS "NVML_LIBRARY: ${NVML_LIBRARY}")
+
+
+target_include_directories(tvm_runtime PUBLIC "/usr/local/cuda/include")
+find_library(NVML_LIBRARY nvidia-ml PATHS /usr/local/cuda/targets/x86_64-linux/lib/stubs)
+if(NVML_LIBRARY)
+  target_link_libraries(tvm PUBLIC ${NVML_LIBRARY})
+  target_link_libraries(tvm_runtime PUBLIC ${NVML_LIBRARY})
+  message(INFO "libnvidia-ml.so found")
+else()
+  message(WARNING "libnvidia-ml.so not found in /usr/local/cuda/targets/x86_64-linux/lib/stubs")
+endif()
+

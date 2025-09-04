@@ -118,3 +118,45 @@ def run_evaluator_common(
         repeated_costs.append(profile_result.results)
     costs = [float(cost) for cost in itertools.chain.from_iterable(repeated_costs)]
     return costs
+
+def run_power_evaluator(
+    rt_mod: Module,
+    device: Device,
+    evaluator_config: EvaluatorConfig,
+    repeated_args: List[T_ARGUMENT_LIST],
+) -> List[float]:
+    """Common function to run the evaluator
+
+    Parameters
+    ----------
+    rt_mod: Module
+        The runtime module
+    device: Device
+        The device to run the evaluator
+    evaluator_config: EvaluatorConfig
+        The evaluator config
+    repeated_args: List[T_ARGUMENT_LIST]
+        The repeated arguments
+
+    Returns
+    -------
+    costs: List[float]
+        The evaluator results
+    """
+    evaluator = rt_mod.power_evaluator(
+        func_name=rt_mod.entry_name,
+        dev=device,
+        number=evaluator_config.number,
+        repeat=evaluator_config.repeat,
+        min_repeat_ms=evaluator_config.min_repeat_ms,
+        f_preproc="cache_flush_cpu_non_first_arg"
+        if evaluator_config.enable_cpu_cache_flush
+        else "",
+    )
+    repeated_costs: List[List[float]] = []
+    for args in repeated_args:
+        device.sync()
+        profile_result = evaluator(*args)
+        repeated_costs.append(profile_result.results)
+    costs = [float(cost) for cost in itertools.chain.from_iterable(repeated_costs)]
+    return costs

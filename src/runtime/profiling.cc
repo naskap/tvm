@@ -22,6 +22,7 @@
  * \brief Runtime profiling including timers.
  */
 
+#include <dlpack/dlpack.h>
 #include <dmlc/json.h>
 #include <tvm/runtime/c_backend_api.h>
 #include <tvm/runtime/data_type.h>
@@ -36,6 +37,11 @@
 #include <map>
 #include <numeric>
 #include <thread>
+#include <fstream>
+
+#include <nvml.h>
+#include <stdexcept>
+#include <string>
 
 namespace tvm {
 namespace runtime {
@@ -908,6 +914,7 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
       } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
 
       double speed = duration_ms / 1e3 / number;
+      std::cout << "speed " << speed << "\n";
       os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
 
       if (cooldown_interval_ms > 0 && (i % repeats_to_cooldown) == 0) {
@@ -920,6 +927,150 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
     arr.size = blob.length();
     arr.data = blob.data();
     // return the time.
+    *rv = arr;
+  };
+  return PackedFunc(ftimer);
+}
+
+long long read_energy_intelcpu() {
+    std::ifstream f("/sys/class/powercap/intel-rapl:0/energy_uj");
+    if (!f.is_open()) {
+        // Log an error or throw an exception. This indicates a problem with the path or permissions.
+        // Using std::cerr for immediate feedback during testing.
+        std::cerr << "Error: Could not open powercap\n";
+        return -1; // Return an error code
+    }
+    long long val;
+    f >> val;
+    if (f.fail()) {
+        // This indicates a problem reading the value from the file.
+        std::cerr << "Error: Failed to read value from powercap" << std::endl;
+        return -1; // Return an error code
+    }
+    return val;
+}
+
+
+
+long long read_energy_nvml(nvmlDevice_t device) {
+
+  unsigned long long energy;
+  // Returns the total energy consumption in millijoules since the driver was loaded.
+  nvmlReturn_t result = nvmlDeviceGetTotalEnergyConsumption(device, &energy);
+  // Get rid of error checking to make measurements more precise
+  // if (result != NVML_SUCCESS) {
+  //   nvmlShutdown();
+  //   throw std::runtime_error(
+  //       std::string("Failed to get energy consumption: ") + nvmlErrorString(result));
+  // }
+
+  return static_cast<long long>(energy);
+}
+
+PackedFunc WrapPowerEvaluator(PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
+                             int limit_zero_time_iterations, int cooldown_interval_ms,
+                             int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc) {
+  ICHECK(pf != nullptr);
+
+  auto ftimer = [pf, dev, number, repeat, min_repeat_ms, limit_zero_time_iterations,
+                 cooldown_interval_ms, repeats_to_cooldown, cache_flush_bytes,
+                 f_preproc](TVMArgs args, TVMRetValue* rv) mutable {
+
+
+    nvmlDevice_t nvml_device;
+    if(dev.device_type == kDLCUDA){
+      nvmlReturn_t result = nvmlInit();
+      if (result != NVML_SUCCESS) {
+        throw std::runtime_error(
+            std::string("Failed to initialize NVML: ") + nvmlErrorString(result));
+      }
+
+      
+      // Assuming GPU 0; adjust if needed
+      result = nvmlDeviceGetHandleByIndex(0, &nvml_device);
+      if (result != NVML_SUCCESS) {
+        nvmlShutdown();
+        throw std::runtime_error(
+            std::string("Failed to get handle for device 0: ") + nvmlErrorString(result));
+      }
+  }
+
+    TVMRetValue temp;
+    std::ostringstream os;
+    long long e_diff = 0;
+    // skip first time call, to activate lazy compilation components.
+    pf.CallPacked(args, &temp);
+
+    // allocate two large arrays to flush L2 cache
+    NDArray arr1, arr2;
+    if (cache_flush_bytes > 0) {
+      arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+      arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+    }
+
+    DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+
+    for (int i = 0; i < repeat; ++i) {
+      if (f_preproc != nullptr) {
+        f_preproc.CallPacked(args, &temp);
+      }
+      double duration_ms = 0.0;
+      int absolute_zero_times = 0;
+      do {
+        if (duration_ms > 0.0) {
+          const double golden_ratio = 1.618;
+          number = static_cast<int>(
+              std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
+        }
+        if (cache_flush_bytes > 0) {
+          arr1.CopyFrom(arr2);
+        }
+        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+        // start timing
+        Timer t = Timer::Start(dev);
+
+        long long e_before;
+        if(dev.device_type == kDLCUDA){
+          e_before = read_energy_nvml(nvml_device);
+        } else{
+          e_before = read_energy_intelcpu();
+        }
+
+        for (int j = 0; j < number; ++j) {
+          pf.CallPacked(args, &temp);
+        }
+        long long e_after;
+        if(dev.device_type == kDLCUDA){
+          e_after = read_energy_nvml(nvml_device);
+        } else{
+          e_after = read_energy_intelcpu();
+        }
+        t->Stop();
+        int64_t t_nanos = t->SyncAndGetElapsedNanos();
+        if (t_nanos == 0) absolute_zero_times++;
+        duration_ms = t_nanos / 1e6;
+        e_diff += e_after - e_before;
+        std::cout << " ebfore " << e_before << "eafter " << e_after << "\n";
+      } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
+
+      double e_avg = static_cast<double>(e_diff) / 1e6 / number; // Avg and scale to make more readable
+      std::cout << "e_avg " << e_avg << "\n";
+      os.write(reinterpret_cast<char*>(&e_avg), sizeof(e_avg));
+
+      if (cooldown_interval_ms > 0 && (i % repeats_to_cooldown) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
+      }
+    }
+
+    if(dev.device_type == kDLCUDA){
+      nvmlShutdown();
+    }
+
+    std::string blob = os.str();
+    TVMByteArray arr;
+    arr.size = blob.length();
+    arr.data = blob.data();
+    // return the power.
     *rv = arr;
   };
   return PackedFunc(ftimer);

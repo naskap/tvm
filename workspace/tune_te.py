@@ -29,8 +29,9 @@ from tvm.meta_schedule.testing.local_rpc import LocalRPC
 import print_schedule_space
 from tvm.meta_schedule.testing import te_workload
 from tvm import te
-from utils import kernel_gen_add_schedule
-from rl_search import RLSearch
+# from utils import kernel_gen_add_schedule
+# from rl_search import RLSearch
+from tvm.target import detect_target
 
 def _parse_args():
     args = argparse.ArgumentParser()
@@ -55,6 +56,11 @@ def _parse_args():
         default=1,
     )
     args.add_argument(
+        "--alloc-repeat",
+        type=int,
+        default=1,
+    )
+    args.add_argument(
         "--min-repeat-ms",
         type=int,
         default=100,
@@ -72,8 +78,27 @@ def _parse_args():
         help="example: True / False",
         required=True,
     )
+
+    args.add_argument(
+        "--quick-path",
+        action = 'store_true'
+    )
+
+
     parsed = args.parse_args()
-    parsed.target = tvm.target.Target("nvidia/nvidia-v100", host="llvm")
+    
+    
+    if(tvm.cuda().exist):
+        parsed.target = detect_target.detect_target_from_device("cuda")
+    elif(tvm.opencl().exist):
+        parsed.target = detect_target.detect_target_from_device("opencl")
+    else:
+        parsed.target = detect_target.detect_target_from_device("cpu")
+
+    # parsed.target = tvm.target.Target("nvidia/nvidia-v100", host="llvm")
+    # parsed.target = tvm.target.Target("nvidia/t1000")
+    # parsed.target = tvm.target.intel_graphics(model="coffeelake_h_gt2")
+    parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12") # Intel laptop processor
 
     # parsed.target = tvm.target.intel_graphics()
     # parsed.rpc_config = ms.runner.RPCConfig(
@@ -91,8 +116,10 @@ logging.basicConfig(
 logging.getLogger("tvm.meta_schedule").setLevel(logging.DEBUG)
 ARGS = _parse_args()
 
-
 def main():
+    import faulthandler
+    faulthandler.enable()
+
     describe()
     with ms.Profiler() as profiler:
         with LocalRPC() as rpc:
@@ -101,6 +128,7 @@ def main():
                     tracker_host=rpc.tracker_host,
                     tracker_port=rpc.tracker_port,
                     tracker_key=rpc.tracker_key,
+                    session_timeout_sec=60*30
                 ),
                 evaluator_config=ms.runner.EvaluatorConfig(
                     number=ARGS.number,
@@ -108,33 +136,50 @@ def main():
                     min_repeat_ms=ARGS.min_repeat_ms,
                     enable_cpu_cache_flush=ARGS.cpu_flush,
                 ),
-                alloc_repeat=3
+                alloc_repeat=ARGS.alloc_repeat,
+                f_run_evaluator = ms.runner.rpc_runner.f_power_evaluator
             )
 
-            f = tvm.get_global_func("kernel_gen_add_schedule")
-            print(f)
-
-            workload =  te.create_prim_func(
-                            te_workload.conv2d_nchw_bias_bn_relu(
-                                n=12,
-                                h=128,
-                                w=136,
-                                ci=4,
-                                co=8,
-                                kh=3,
-                                kw=3,
-                                stride=2,
-                                padding=0,
-                                dilation=0,
-                                in_dtype="float16",
-                                out_dtype="float32",
+            if(ARGS.quick_path):
+                workload =  te.create_prim_func(
+                                te_workload.conv2d_nchw_bias_bn_relu(
+                                    n=1,
+                                    h=4,
+                                    w=6,
+                                    ci=4,
+                                    co=8,
+                                    kh=3,
+                                    kw=3,
+                                    stride=1,
+                                    padding=1,
+                                    dilation=1,
+                                    in_dtype="float32",
+                                    out_dtype="float32",
+                                )
                             )
-                        )
-            
-            target = ARGS.target
+                strategy = "replay-trace"
+            else:
+                workload =  te.create_prim_func(
+                        te_workload.conv2d_nchw_bias_bn_relu(
+                                    n=12,
+                                    h=128,
+                                    w=136,
+                                    ci=3,
+                                    co=24,
+                                    kh=3,
+                                    kw=3,
+                                    stride=2,
+                                    padding=1,
+                                    dilation=1,
+                                    in_dtype="float32",
+                                    out_dtype="float32",
+                                )
+                            )
+                strategy = "evolutionary"
+
+
             
             # print_schedule_space.print_sketches_for_workload(workload)
-            # import pdb; pdb.set_trace()
 
             db : Optional[tir.Schedule] = ms.tir_integration.tune_tir(
                 mod=ms.tir_integration._normalize_mod(workload),
@@ -143,13 +188,14 @@ def main():
                 max_trials_global=ARGS.num_trials,
                 num_trials_per_iter=64,
                 runner=rpc_runner,
+                strategy=strategy,
                 cost_model=ms.cost_model.XGBModel(  # type: ignore
                     extractor=ms.feature_extractor.PerStoreFeature(),
                     adaptive_training=ARGS.adaptive_training,
-                ),
-                strategy=RLSearch(),
+                )
             )
-            sch = ms.tir_integration.compile_tir(db, workload, target)
+            ms.runner.rpc_runner.plot_normalized_results()
+            sch = ms.tir_integration.compile_tir(db, workload, ARGS.target)
 
     print("Tuning Time:")
     print(profiler.table())

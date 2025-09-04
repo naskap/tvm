@@ -33,11 +33,13 @@ from ..utils import (
 )
 from .config import EvaluatorConfig, RPCConfig
 from .runner import PyRunner, PyRunnerFuture, RunnerFuture, RunnerInput, RunnerResult
+import numpy as np
 from .utils import (
     T_ARG_INFO_JSON_OBJ_LIST,
     T_ARGUMENT_LIST,
     alloc_argument_common,
     run_evaluator_common,
+    run_power_evaluator
 )
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
@@ -130,6 +132,9 @@ class RPCRunnerFuture(PyRunnerFuture):
             )
         return RunnerResult(run_secs, None)
 
+
+global_energy_results     = []
+global_latency_results = []
 
 @derived_object
 class RPCRunner(PyRunner):
@@ -295,7 +300,7 @@ class RPCRunner(PyRunner):
     def run(self, runner_inputs: List[RunnerInput]) -> List[RunnerFuture]:
         results: List[RunnerFuture] = []
         for runner_input in runner_inputs:
-            future = RPCRunnerFuture(
+            future_energy = RPCRunnerFuture(
                 future=self.pool.submit(
                     _worker_func,
                     self.f_create_session,
@@ -312,7 +317,24 @@ class RPCRunner(PyRunner):
                 ),
                 timeout_sec=self.rpc_config.session_timeout_sec,
             )
-            results.append(future)  # type: ignore
+            future_latency = RPCRunnerFuture(future=self.pool.submit(
+                    _worker_func,
+                    self.f_create_session,
+                    self.f_upload_module,
+                    self.f_alloc_argument,
+                    default_run_evaluator,
+                    self.f_cleanup,
+                    self.rpc_config,
+                    self.evaluator_config,
+                    self.alloc_repeat,
+                    str(runner_input.artifact_path),
+                    str(runner_input.device_type),
+                    tuple(arg_info.as_json() for arg_info in runner_input.args_info),
+                ),timeout_sec=self.rpc_config.session_timeout_sec,)
+            results.append(future_energy)  # type: ignore
+            global_energy_results.append(future_energy.result())
+            global_latency_results.append(future_latency.result())
+
         return results
 
     def _sanity_check(self) -> None:
@@ -400,14 +422,70 @@ def _worker_func(
             )
         # Step 4: Run time_evaluator
         with Profiler.timeit("LocalRunner/run_evaluator"):
-            costs: List[float] = f_run_evaluator(
-                session,
-                rt_mod,
-                device,
-                evaluator_config,
-                repeated_args,
-            )
+            costs: List[float]        = f_run_evaluator(session, rt_mod, device, evaluator_config, repeated_args)
+
     return costs
+
+def plot_normalized_results():
+    import matplotlib.pyplot as plt
+
+    def collapse_results(results : List[RunnerResult]):
+        to_return = []
+        for result in results:
+            to_return += [float(elmt) for elmt in result.run_secs]
+
+        return to_return
+
+    # Helper function to normalize a list of numbers
+    def normalize(data):
+        arr = np.array(data)
+        diff = arr.max() - arr.min()
+        return arr if diff == 0 else (arr - arr.min()) / diff
+
+    collapsed_energies  = collapse_results(global_energy_results)
+    collapsed_latencies = collapse_results(global_latency_results)
+
+    print(f"collapsed_energies {collapsed_energies}")
+    print(f"collapsed_latencies {collapsed_latencies}")
+    normalized_costs = normalize(collapsed_energies)
+    normalized_latencies = normalize(collapsed_latencies)
+    time_steps = range(len(collapsed_energies))
+        
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_steps, normalized_costs, label="Normalized Energy Usages", marker="o")
+    plt.plot(time_steps, normalized_latencies, label="Normalized Latencies", marker="x")
+    plt.xlabel("Time Step")
+    plt.ylabel("Normalized Value")
+    plt.title("Normalized Costs and Latencies Time Series")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+    # Define threshold for low-latency (normalized value)
+    low_latency_threshold = np.percentile(normalized_latencies, 5)
+
+    # Convert results to numpy arrays for filtering
+    norm_costs = np.array(normalized_costs)
+    norm_latencies = np.array(normalized_latencies)
+    time_steps_arr = np.array(time_steps)
+
+    # Filter indices where normalized latency is below threshold
+    low_indices = norm_latencies < low_latency_threshold
+
+    # Only plot if there are any low-latency samples
+    if low_indices.any():
+        plt.figure(figsize=(10, 6))
+        plt.plot(time_steps_arr[low_indices], norm_costs[low_indices], label="Normalized Energy Usages (Low Latency)", marker="o")
+        plt.plot(time_steps_arr[low_indices], norm_latencies[low_indices], label="Normalized Latencies (Low Latency)", marker="x")
+        plt.xlabel("Time Step")
+        plt.ylabel("Normalized Value")
+        plt.title("Normalized Costs and Latencies for Low-Latency Samples")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    else:
+        print("No low-latency samples found under the threshold of", low_latency_threshold)
 
 
 def default_create_session(rpc_config: RPCConfig) -> RPCSession:
@@ -513,6 +591,37 @@ def default_run_evaluator(
         The evaluator results
     """
     return run_evaluator_common(rt_mod, device, evaluator_config, repeated_args)
+
+def f_power_evaluator(
+    session: RPCSession,  # pylint: disable=unused-argument
+    rt_mod: Module,
+    device: Device,
+    evaluator_config: EvaluatorConfig,
+    repeated_args: List[T_ARGUMENT_LIST],
+) -> List[float]:
+    """Default function to run the evaluator
+
+    Parameters
+    ----------
+    session: RPCSession
+        The session to run the evaluator
+    rt_mod: Module
+        The runtime module
+    device: Device
+        The device to run the evaluator
+    evaluator_config: EvaluatorConfig
+        The evaluator config
+    repeated_args: List[T_ARGUMENT_LIST]
+        The repeated arguments
+
+    Returns
+    -------
+    costs: List[float]
+        The evaluator results
+    """
+    return run_power_evaluator(rt_mod, device, evaluator_config, repeated_args)
+
+
 
 
 def default_cleanup(

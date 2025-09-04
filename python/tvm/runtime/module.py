@@ -411,6 +411,106 @@ class Module(object):
         except NameError:
             raise NameError("time_evaluator is only supported when RPC is enabled")
 
+
+    def power_evaluator(
+        self,
+        func_name,
+        dev,
+        number=10,
+        repeat=1,
+        min_repeat_ms=0,
+        limit_zero_time_iterations=100,
+        cooldown_interval_ms=0,
+        repeats_to_cooldown=1,
+        cache_flush_bytes=0,
+        f_preproc="",
+    ):
+        """Get an evaluator that measures power of running function.
+
+        Parameters
+        ----------
+        func_name: str
+            The name of the function in the module.
+
+        dev: Device
+            The device we should run this function on.
+
+        number: int
+            The number of times to run this function for taking average.
+            We call these runs as one `repeat` of measurement.
+
+        repeat: int, optional
+            The number of times to repeat the measurement.
+            In total, the function will be invoked (1 + number x repeat) times,
+            where the first one is warm up and will be discarded.
+            The returned result contains `repeat` costs,
+            each of which is an average of `number` costs.
+
+        min_repeat_ms: int, optional
+            The minimum duration of one `repeat` in milliseconds.
+            By default, one `repeat` contains `number` runs. If this parameter is set,
+            the parameters `number` will be dynamically adjusted to meet the
+            minimum duration requirement of one `repeat`.
+            i.e., When the run time of one `repeat` falls below this time, the `number` parameter
+            will be automatically increased.
+
+        limit_zero_time_iterations: int, optional
+            The maximum number of repeats when measured time is equal to 0.
+            It helps to avoid hanging during measurements.
+
+        cooldown_interval_ms: int, optional
+            The cooldown interval in milliseconds between the number of repeats defined by
+            `repeats_to_cooldown`.
+
+        repeats_to_cooldown: int, optional
+            The number of repeats before the cooldown is activated.
+
+        cache_flush_bytes: int, optional
+            The number of bytes to flush from the cache before each repeat.
+
+        f_preproc: str, optional
+            The preprocess function name we want to execute before executing the time evaluator.
+
+        Note
+        ----
+        The function will be invoked  (1 + number x repeat) times,
+        with the first call discarded in case there is lazy initialization.
+
+        Returns
+        -------
+        ftimer : function
+            The function that takes same argument as func and returns a BenchmarkResult.
+            The ProfileResult reports `repeat` time costs in seconds.
+        """
+        try:
+            feval = _ffi_api.RPCPowerEvaluator(
+                self,
+                func_name,
+                dev.device_type,
+                dev.device_id,
+                number,
+                repeat,
+                min_repeat_ms,
+                limit_zero_time_iterations,
+                cooldown_interval_ms,
+                repeats_to_cooldown,
+                cache_flush_bytes,
+                f_preproc,
+            )
+
+            def evaluator(*args):
+                """Internal wrapped evaluator."""
+                # Wrap feval so we can add more stats in future.
+                blob = feval(*args)
+                fmt = "@" + ("d" * repeat)
+                results = struct.unpack(fmt, blob)
+                return BenchmarkResult(results)
+
+            return evaluator
+        except NameError:
+            raise NameError("time_evaluator is only supported when RPC is enabled")
+
+
     def _collect_from_import_tree(self, filter_func):
         """Helper function to collect modules from the tree matching a filter_func, then return it.
 
