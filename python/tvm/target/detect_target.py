@@ -92,6 +92,7 @@ def _detect_vulkan(dev: Device) -> Target:
 
 def _detect_cpu(dev: Device) -> Target:  # pylint: disable=unused-argument
     """Detect the host CPU architecture."""
+    import os
     return Target(
         {
             "kind": "llvm",
@@ -103,6 +104,7 @@ def _detect_cpu(dev: Device) -> Target:  # pylint: disable=unused-argument
                 "tvm.codegen.llvm.GetHostCPUName",
                 allow_missing=False,
             )(),
+            "num-cores" : os.cpu_count()
         }
     )
 

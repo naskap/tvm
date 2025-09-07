@@ -17,5 +17,5 @@ source ~/.bashrc
 echo $(module list)
 conda activate tvm-build-venv
 python -c "import tvm; print(tvm.__file__); print(tvm.cuda().exist); print(tvm.opencl().exist)"
-CUDA_LAUNCH_BLOCKING=1 python tune_te.py --num-trials 256 --number 50 --repeat 1 --alloc-repeat 5 --work-dir /home/nathan/sandbox/code/tvm/workspace/logs --cpu-flush True
+CUDA_LAUNCH_BLOCKING=1 python tune_te.py --num-trials 5 --number 100 --repeat 3 --work-dir /home/nathan/sandbox/code/tvm/workspace/logs --cpu-flush False --quick-path
 

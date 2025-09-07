@@ -32,6 +32,7 @@ from tvm import te
 # from utils import kernel_gen_add_schedule
 # from rl_search import RLSearch
 from tvm.target import detect_target
+import multiprocessing
 
 def _parse_args():
     args = argparse.ArgumentParser()
@@ -83,22 +84,33 @@ def _parse_args():
         "--quick-path",
         action = 'store_true'
     )
+    args.add_argument(
+        "--cpu",
+        action = 'store_true'
+    )
 
 
     parsed = args.parse_args()
     
     
-    if(tvm.cuda().exist):
+    if(tvm.cuda().exist and not parsed.cpu):
         parsed.target = detect_target.detect_target_from_device("cuda")
-    elif(tvm.opencl().exist):
+        parsed.target = tvm.target.Target("nvidia/t1000")
+    elif(tvm.opencl().exist and not parsed.cpu):
         parsed.target = detect_target.detect_target_from_device("opencl")
     else:
+        # Detection needed to be modified to set num-cores
         parsed.target = detect_target.detect_target_from_device("cpu")
+        # target_attrs = dict(target_tmp.attrs)
+        # target_attrs["num-cores"] = multiprocessing.cpu_count()
+        # target_attrs["kind"] = target_tmp.kind.name
+        # parsed.target = tvm.target.Target(target_attrs)
+        # parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12")
 
     # parsed.target = tvm.target.Target("nvidia/nvidia-v100", host="llvm")
     # parsed.target = tvm.target.Target("nvidia/t1000")
     # parsed.target = tvm.target.intel_graphics(model="coffeelake_h_gt2")
-    parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12") # Intel laptop processor
+    # parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12") # Intel laptop processor
 
     # parsed.target = tvm.target.intel_graphics()
     # parsed.rpc_config = ms.runner.RPCConfig(
@@ -118,6 +130,7 @@ ARGS = _parse_args()
 
 def main():
     import faulthandler
+
     faulthandler.enable()
 
     describe()
@@ -128,7 +141,7 @@ def main():
                     tracker_host=rpc.tracker_host,
                     tracker_port=rpc.tracker_port,
                     tracker_key=rpc.tracker_key,
-                    session_timeout_sec=60*30
+                    session_timeout_sec=10
                 ),
                 evaluator_config=ms.runner.EvaluatorConfig(
                     number=ARGS.number,
