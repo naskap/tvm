@@ -317,24 +317,7 @@ class RPCRunner(PyRunner):
                 ),
                 timeout_sec=self.rpc_config.session_timeout_sec,
             )
-            future_latency = RPCRunnerFuture(future=self.pool.submit(
-                    _worker_func,
-                    self.f_create_session,
-                    self.f_upload_module,
-                    self.f_alloc_argument,
-                    default_run_evaluator,
-                    self.f_cleanup,
-                    self.rpc_config,
-                    self.evaluator_config,
-                    self.alloc_repeat,
-                    str(runner_input.artifact_path),
-                    str(runner_input.device_type),
-                    tuple(arg_info.as_json() for arg_info in runner_input.args_info),
-                ),timeout_sec=self.rpc_config.session_timeout_sec,)
             results.append(future_energy)  # type: ignore
-            global_energy_results.append(future_energy.result())
-            global_latency_results.append(future_latency.result())
-
         return results
 
     def _sanity_check(self) -> None:
@@ -426,66 +409,69 @@ def _worker_func(
 
     return costs
 
-def plot_normalized_results():
+
+
+def plot_normalized_results(energy_results, latency_results):
     import matplotlib.pyplot as plt
-
-    def collapse_results(results : List[RunnerResult]):
-        to_return = []
-        for result in results:
-            to_return += [float(elmt) for elmt in result.run_secs]
-
-        return to_return
-
-    # Helper function to normalize a list of numbers
-    def normalize(data):
-        arr = np.array(data)
-        diff = arr.max() - arr.min()
-        return arr if diff == 0 else (arr - arr.min()) / diff
-
-    collapsed_energies  = collapse_results(global_energy_results)
-    collapsed_latencies = collapse_results(global_latency_results)
-
-    print(f"collapsed_energies {collapsed_energies}")
-    print(f"collapsed_latencies {collapsed_latencies}")
-    normalized_costs = normalize(collapsed_energies)
-    normalized_latencies = normalize(collapsed_latencies)
-    time_steps = range(len(collapsed_energies))
-        
+    # Accept doubly nested lists: each inner list is multiple samples of a single data point.
+    # Compute per-point mean and std, normalize, then plot with error bars.
+    def _stats(nested):
+        arrs = [np.asarray(x, dtype=float) for x in nested]
+        means = np.array([a.mean() if a.size else np.nan for a in arrs], dtype=float)
+        stds = np.array([a.std(ddof=1) if a.size > 1 else 0.0 for a in arrs], dtype=float)
+        return means, stds
+    energy_means, energy_stds = _stats(energy_results)
+    latency_means, latency_stds = _stats(latency_results)
+    def _normalize_with_err(means, stds):
+        if means.size == 0:
+            return means, stds
+        min_v = np.nanmin(means)
+        max_v = np.nanmax(means)
+        diff = max_v - min_v
+        if diff == 0 or not np.isfinite(diff):
+            # Only shift if diff is zero or invalid; std stays unchanged
+            return means - min_v, stds
+        return (means - min_v) / diff, stds / diff
+    norm_energy_means, norm_energy_stds = _normalize_with_err(energy_means, energy_stds)
+    norm_latency_means, norm_latency_stds = _normalize_with_err(latency_means, latency_stds)
+    time_steps = np.arange(len(energy_means))
+    # Plot averages with error bars
     plt.figure(figsize=(10, 6))
-    plt.plot(time_steps, normalized_costs, label="Normalized Energy Usages", marker="o")
-    plt.plot(time_steps, normalized_latencies, label="Normalized Latencies", marker="x")
-    plt.xlabel("Time Step")
+    plt.errorbar(
+        time_steps, norm_energy_means, yerr=norm_energy_stds,
+        label="Normalized Energy Usages", fmt="-o", capsize=3
+    )
+    plt.errorbar(
+        time_steps, norm_latency_means, yerr=norm_latency_stds,
+        label="Normalized Latencies", fmt="-x", capsize=3
+    )
+    plt.xlabel("Top K Sample")
     plt.ylabel("Normalized Value")
-    plt.title("Normalized Costs and Latencies Time Series")
+    plt.title("Normalized Costs and Latencies Time Series (Mean ± Std)")
     plt.legend()
     plt.grid(True)
     plt.show()
+    fig, (ax_energy, ax_latency) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    ax_energy.errorbar(
+        time_steps, energy_means, yerr=energy_stds,
+        label="Energy Usages", fmt="-o", capsize=3
+    )
+    ax_energy.set_ylabel("Energy Value")
+    ax_energy.set_title("Energy Usage (Mean ± Std)")
+    ax_energy.grid(True)
+    ax_energy.legend()
+    ax_latency.errorbar(
+        time_steps, latency_means, yerr=latency_stds,
+        label="Latencies", fmt="-x", capsize=3
+    )
+    ax_latency.set_xlabel("Top K Sample")
+    ax_latency.set_ylabel("Latency Value")
+    ax_latency.set_title("Latency (Mean ± Std)")
+    ax_latency.grid(True)
+    ax_latency.legend()
+    plt.tight_layout()
+    plt.show()
 
-
-    # Define threshold for low-latency (normalized value)
-    low_latency_threshold = np.percentile(normalized_latencies, 5)
-
-    # Convert results to numpy arrays for filtering
-    norm_costs = np.array(normalized_costs)
-    norm_latencies = np.array(normalized_latencies)
-    time_steps_arr = np.array(time_steps)
-
-    # Filter indices where normalized latency is below threshold
-    low_indices = norm_latencies < low_latency_threshold
-
-    # Only plot if there are any low-latency samples
-    if low_indices.any():
-        plt.figure(figsize=(10, 6))
-        plt.plot(time_steps_arr[low_indices], norm_costs[low_indices], label="Normalized Energy Usages (Low Latency)", marker="o")
-        plt.plot(time_steps_arr[low_indices], norm_latencies[low_indices], label="Normalized Latencies (Low Latency)", marker="x")
-        plt.xlabel("Time Step")
-        plt.ylabel("Normalized Value")
-        plt.title("Normalized Costs and Latencies for Low-Latency Samples")
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-    else:
-        print("No low-latency samples found under the threshold of", low_latency_threshold)
 
 
 def default_create_session(rpc_config: RPCConfig) -> RPCSession:
