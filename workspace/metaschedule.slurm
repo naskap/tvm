@@ -16,6 +16,5 @@ module purge
 source ~/.bashrc
 echo $(module list)
 conda activate tvm-build-venv
-python -c "import tvm; print(tvm.__file__); print(tvm.cuda().exist); print(tvm.opencl().exist)"
-CUDA_LAUNCH_BLOCKING=1 python tune_te.py --num-trials 256 --number 50 --repeat 1 --alloc-repeat 5 --work-dir /home/nathan/sandbox/code/tvm/workspace/logs --cpu-flush True
-
+python -c "import tvm; print(tvm.__file__); print(tvm._ffi.base._LIB); print(tvm.cuda().exist); print(tvm.opencl().exist)"
+CUDA_LAUNCH_BLOCKING=1 python tune_te.py --num-trials 1000 --number 50 --repeat 1 --alloc-repeat 5 --work-dir /home/nathan/sandbox/code/tvm/workspace/cuda_powertuning --cpu-flush False

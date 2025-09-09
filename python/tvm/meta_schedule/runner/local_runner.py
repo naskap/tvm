@@ -34,6 +34,7 @@ from .utils import (
     T_ARGUMENT_LIST,
     alloc_argument_common,
     run_evaluator_common,
+    run_power_evaluator
 )
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
@@ -113,6 +114,35 @@ class LocalRunnerFuture(PyRunnerFuture):
 
     def result(self) -> RunnerResult:
         return RunnerResult(self.res, self.error_message)
+
+
+def f_power_evaluator(
+    rt_mod: Module,
+    device: Device,
+    evaluator_config: EvaluatorConfig,
+    repeated_args: List[T_ARGUMENT_LIST],
+) -> List[float]:
+    """Default function to run the evaluator
+
+    Parameters
+    ----------
+    session: RPCSession
+        The session to run the evaluator
+    rt_mod: Module
+        The runtime module
+    device: Device
+        The device to run the evaluator
+    evaluator_config: EvaluatorConfig
+        The evaluator config
+    repeated_args: List[T_ARGUMENT_LIST]
+        The repeated arguments
+
+    Returns
+    -------
+    costs: List[float]
+        The evaluator results
+    """
+    return run_power_evaluator(rt_mod, device, evaluator_config, repeated_args)
 
 
 def _worker_func(

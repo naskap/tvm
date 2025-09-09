@@ -22,6 +22,7 @@ from typing import Optional
 import tvm
 from tvm import meta_schedule as ms
 from tvm import tir
+
 from tvm.meta_schedule.testing.te_workload import create_te_workload
 from tvm.support import describe
 from tvm.testing.utils import strtobool
@@ -33,6 +34,20 @@ from tvm import te
 # from rl_search import RLSearch
 from tvm.target import detect_target
 import multiprocessing
+
+from tvm.script import tir as T
+@T.prim_func
+def matmul(a: T.handle, b: T.handle, c: T.handle) -> None:
+    A = T.match_buffer(a, [128, 128])
+    B = T.match_buffer(b, [128, 128])
+    C = T.match_buffer(c, [128, 128])
+    for i, j, k in T.grid(128, 128, 128):
+        with T.block("update"):
+            vi, vj, vk = T.axis.remap("SSR", [i, j, k])
+            with T.init():
+                C[vi, vj] = 0.0
+            C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vj, vk]
+
 
 def _parse_args():
     args = argparse.ArgumentParser()
@@ -107,18 +122,6 @@ def _parse_args():
         # parsed.target = tvm.target.Target(target_attrs)
         # parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12")
 
-    # parsed.target = tvm.target.Target("nvidia/nvidia-v100", host="llvm")
-    # parsed.target = tvm.target.Target("nvidia/t1000")
-    # parsed.target = tvm.target.intel_graphics(model="coffeelake_h_gt2")
-    # parsed.target = tvm.target.Target("llvm -mtriple=x86_64-- -mcpu=core-avx2 -num-cores 12") # Intel laptop processor
-
-    # parsed.target = tvm.target.intel_graphics()
-    # parsed.rpc_config = ms.runner.RPCConfig(
-    #     tracker_host=parsed.rpc_host,
-    #     tracker_port=parsed.rpc_port,
-    #     tracker_key=parsed.rpc_key,
-    #     session_timeout_sec=60,
-    # )
     return parsed
 
 
@@ -130,85 +133,77 @@ ARGS = _parse_args()
 
 def main():
     import faulthandler
-
     faulthandler.enable()
-
     describe()
     with ms.Profiler() as profiler:
-        with LocalRPC() as rpc:
-            rpc_runner = ms.runner.RPCRunner(
-                rpc_config=ms.runner.RPCConfig(
-                    tracker_host=rpc.tracker_host,
-                    tracker_port=rpc.tracker_port,
-                    tracker_key=rpc.tracker_key,
-                    session_timeout_sec=10
-                ),
-                evaluator_config=ms.runner.EvaluatorConfig(
-                    number=ARGS.number,
-                    repeat=ARGS.repeat,
-                    min_repeat_ms=ARGS.min_repeat_ms,
-                    enable_cpu_cache_flush=ARGS.cpu_flush,
-                ),
-                alloc_repeat=ARGS.alloc_repeat,
-                f_run_evaluator = ms.runner.rpc_runner.f_power_evaluator
-            )
+        local_runner = ms.runner.LocalRunner(
+            evaluator_config=ms.runner.EvaluatorConfig(
+                number=ARGS.number,
+                repeat=ARGS.repeat,
+                min_repeat_ms=ARGS.min_repeat_ms,
+                enable_cpu_cache_flush=ARGS.cpu_flush,
+            ),
+            alloc_repeat=ARGS.alloc_repeat,
+            f_run_evaluator = ms.runner.local_runner.f_power_evaluator
+        )
 
-            if(ARGS.quick_path):
-                workload =  te.create_prim_func(
-                                te_workload.conv2d_nchw_bias_bn_relu(
-                                    n=1,
-                                    h=4,
-                                    w=6,
-                                    ci=4,
-                                    co=8,
-                                    kh=3,
-                                    kw=3,
-                                    stride=1,
-                                    padding=1,
-                                    dilation=1,
-                                    in_dtype="float32",
-                                    out_dtype="float32",
-                                )
+        if(ARGS.quick_path):
+            workload =  te.create_prim_func(
+                            te_workload.conv2d_nchw_bias_bn_relu(
+                                n=1,
+                                h=4,
+                                w=6,
+                                ci=4,
+                                co=8,
+                                kh=3,
+                                kw=3,
+                                stride=1,
+                                padding=1,
+                                dilation=1,
+                                in_dtype="float32",
+                                out_dtype="float32",
                             )
-                strategy = "replay-trace"
-            else:
-                workload =  te.create_prim_func(
-                        te_workload.conv2d_nchw_bias_bn_relu(
-                                    n=12,
-                                    h=128,
-                                    w=136,
-                                    ci=3,
-                                    co=24,
-                                    kh=3,
-                                    kw=3,
-                                    stride=2,
-                                    padding=1,
-                                    dilation=1,
-                                    in_dtype="float32",
-                                    out_dtype="float32",
-                                )
+                        )
+            strategy = "replay-trace"
+        else:
+            workload =  te.create_prim_func(
+                    te_workload.conv2d_nchw_bias_bn_relu(
+                                n=12,
+                                h=128,
+                                w=136,
+                                ci=3,
+                                co=24,
+                                kh=3,
+                                kw=3,
+                                stride=2,
+                                padding=1,
+                                dilation=1,
+                                in_dtype="float32",
+                                out_dtype="float32",
                             )
-                strategy = "evolutionary"
+                        )
+            strategy = "evolutionary"
 
 
-            
-            # print_schedule_space.print_sketches_for_workload(workload)
+        
+        # print_schedule_space.print_sketches_for_workload(workload)
 
-            db : Optional[tir.Schedule] = ms.tir_integration.tune_tir(
-                mod=ms.tir_integration._normalize_mod(workload),
-                target=ARGS.target,
-                work_dir=ARGS.work_dir,
-                max_trials_global=ARGS.num_trials,
-                num_trials_per_iter=64,
-                runner=rpc_runner,
-                strategy=strategy,
-                cost_model=ms.cost_model.XGBModel(  # type: ignore
-                    extractor=ms.feature_extractor.PerStoreFeature(),
-                    adaptive_training=ARGS.adaptive_training,
-                )
+        
+        db : Optional[tir.Schedule] = ms.tir_integration.tune_tir(
+            #mod=ms.tir_integration._normalize_mod(workload),  
+            mod=workload,
+            target=ARGS.target,
+            work_dir=ARGS.work_dir,
+            max_trials_global=ARGS.num_trials,
+            num_trials_per_iter=64,
+            runner=local_runner,
+            strategy=strategy,
+            cost_model=ms.cost_model.XGBModel(  # type: ignore
+                extractor=ms.feature_extractor.PerStoreFeature(),
+                adaptive_training=ARGS.adaptive_training,
             )
-            ms.runner.rpc_runner.plot_normalized_results()
-            sch = ms.tir_integration.compile_tir(db, workload, ARGS.target)
+        )
+        sch = ms.tir_integration.compile_tir(db, workload, ARGS.target)
 
     print("Tuning Time:")
     print(profiler.table())
