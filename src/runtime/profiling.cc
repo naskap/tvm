@@ -997,7 +997,6 @@ PackedFunc WrapPowerEvaluator(PackedFunc pf, Device dev, int number, int repeat,
 
     TVMRetValue temp;
     std::ostringstream os;
-    long long e_diff = 0;
     // skip first time call, to activate lazy compilation components.
     pf.CallPacked(args, &temp);
 
@@ -1016,6 +1015,7 @@ PackedFunc WrapPowerEvaluator(PackedFunc pf, Device dev, int number, int repeat,
       }
       double duration_ms = 0.0;
       int absolute_zero_times = 0;
+      long long e_diff = 0;
       do {
         if (duration_ms > 0.0) {
           const double golden_ratio = 1.618;
@@ -1053,7 +1053,7 @@ PackedFunc WrapPowerEvaluator(PackedFunc pf, Device dev, int number, int repeat,
         std::cout << " ebfore " << e_before << "eafter " << e_after << "\n";
       } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
 
-      double e_avg = static_cast<double>(e_diff) / 1e6 / number; // Avg and scale to make more readable
+      double e_avg = static_cast<double>(e_diff) / number;
       std::cout << "e_avg " << e_avg << "\n";
       os.write(reinterpret_cast<char*>(&e_avg), sizeof(e_avg));
 
