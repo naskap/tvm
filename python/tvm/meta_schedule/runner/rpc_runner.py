@@ -451,7 +451,7 @@ def plot_normalized_results(energy_results, latency_results):
     plt.grid(True)
     import datetime
     plt.savefig(f"costs_and_latencies_norm{datetime.datetime.now().date().isoformat()} {datetime.datetime.now().hour}.png")
-    plt.show()
+    # plt.show()
     fig, (ax_energy, ax_latency) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     ax_energy.errorbar(
         time_steps, energy_means, yerr=energy_stds,
@@ -472,7 +472,7 @@ def plot_normalized_results(energy_results, latency_results):
     ax_latency.legend()
     plt.tight_layout()
     plt.savefig(f"costs_and_latencies_abs{datetime.datetime.now().date().isoformat()} {datetime.datetime.now().hour}.png")
-    plt.show()
+    # plt.show()
 
 
 
